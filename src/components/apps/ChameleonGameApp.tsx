@@ -98,6 +98,25 @@ export function ChameleonGameApp() {
   const socketRef = useRef<WebSocket | null>(null);
   const movementIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const roomStateRef = useRef<GameRoom | null>(null);
+
+  useEffect(() => {
+    roomStateRef.current = roomState;
+  }, [roomState]);
+
+  useEffect(() => {
+    return () => {
+      if (movementIntervalRef.current) {
+        clearInterval(movementIntervalRef.current);
+      }
+      if (socketRef.current) {
+        try {
+          socketRef.current.close();
+        } catch (e) {}
+        socketRef.current = null;
+      }
+    };
+  }, []);
   
   // Keyboard movement tracking
   const keysPressedRef = useRef<{ [key: string]: boolean }>({});
@@ -191,20 +210,21 @@ export function ChameleonGameApp() {
     setRoomState(null);
   };
 
-  // Keyboard and movement hooks
+  // Keyboard and movement hooks (depend only on join status & playerId so 25Hz state_update does not tear down loops)
   useEffect(() => {
-    if (!isJoined || !roomState) return;
+    if (!isJoined || !playerId) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
       const key = e.key.toLowerCase();
       if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].includes(key)) {
-        if (document.activeElement?.tagName === 'INPUT') return; // skip inside text inputs
-        
+        if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
+
         e.preventDefault();
+        e.stopPropagation();
         keysPressedRef.current[key] = true;
-        
+
         // Attack triggered by Space
-        if (key === ' ' && roomState.seekerId === playerId) {
+        if (key === ' ' && roomStateRef.current?.seekerId === playerId) {
           handleTriggerAttack();
         }
       }
@@ -222,7 +242,8 @@ export function ChameleonGameApp() {
 
     // Movement Loop (runs at ~40Hz for fluid local responsiveness)
     movementIntervalRef.current = setInterval(() => {
-      const me = roomState.players[playerId];
+      const currentRoom = roomStateRef.current;
+      const me = currentRoom?.players[playerId];
       if (!me || !me.isAlive) return;
 
       let dx = 0;
@@ -255,8 +276,9 @@ export function ChameleonGameApp() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
       if (movementIntervalRef.current) clearInterval(movementIntervalRef.current);
+      keysPressedRef.current = {};
     };
-  }, [isJoined, roomState, playerId]);
+  }, [isJoined, playerId]);
 
   // Scroll chat to bottom
   useEffect(() => {
@@ -335,7 +357,7 @@ export function ChameleonGameApp() {
 
   const handleUnlockSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (passwordInput === 'mozunbu_1203') {
+    if (passwordInput === 'mozunbu1203') {
       setIsUnlocked(true);
       setPasswordError(false);
     } else {

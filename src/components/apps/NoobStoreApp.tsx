@@ -23,63 +23,365 @@ import {
   Loader2
 } from 'lucide-react';
 import { AppIcon } from '../AppIcon';
+import { CURATED_URL_TO_ICON_ID, resolveCustomAppIconId } from '../CustomAppIcons';
 import { SYSTEM_STORE_APPS, StoreAppInfo, getInstalledSystemAppIds, setInstalledSystemAppIds } from '../../data/storeApps';
 import { findAvailableGridSpot } from '../../utils/grid';
+import { deriveCustomAppTitleFromUrl, normalizeCustomWebUrl } from '../../utils/customWebUrl';
 
 interface InstalledCustomApp {
   id: string;
   title: string;
   url: string;
   iconChar: string;
+  iconId?: string;
   installedAt: string;
 }
 
-const CURATED_CUSTOM_APPS = [
+interface CuratedCustomApp {
+  id: string;
+  title: string;
+  url: string;
+  desc: string;
+  iconChar: string;
+  category: 'Game' | 'Creative' | 'Education' | 'Utilities';
+  developer: string;
+  appIconId?: string;
+  systemAppId?: string;
+}
+
+const CURATED_CUSTOM_APPS: CuratedCustomApp[] = [
   {
-    id: 'curated-tetris',
-    title: 'Tetris Web Classic',
-    url: 'https://raw.githack.com/jakesgordon/javascript-tetris/master/index.html',
-    desc: 'Pure HTML5/JS classic Tetris puzzle block game.',
-    iconChar: '🎮',
+    id: 'curated-racing',
+    title: 'レーシングカーゲーム (LibreCorsa)',
+    url: 'https://librecorsa.org/',
+    desc: 'ブラウザで本格レースを楽しめるオープンソース・レーシングカーゲーム。',
+    iconChar: '🏎️',
     category: 'Game',
-    developer: 'Jake Gordon'
-  },
-  {
-    id: 'curated-pixel',
-    title: 'Pixel Art Paint',
-    url: 'https://raw.githack.com/mitchgavan/react-pixel-art/master/index.html',
-    desc: 'Fun retro 8-bit style canvas drawing paint app.',
-    iconChar: '🎨',
-    category: 'Creative',
-    developer: 'Mitch Gavan'
+    developer: 'LibreCorsa',
+    appIconId: 'racing',
+    systemAppId: 'racing',
   },
   {
     id: 'curated-flappy',
     title: 'Floppy Bird',
-    url: 'https://raw.githack.com/nebez/floppybird/master/index.html',
-    desc: 'The addictive flapping bird challenge with audio and physics.',
+    url: 'https://nebez.github.io/floppybird/',
+    desc: 'タイミング良く飛んで緑の土管をすり抜ける中毒性抜群の名作アクション。',
     iconChar: '🐦',
     category: 'Game',
-    developer: 'Nebez Briefkani'
+    developer: 'Nebez Briefkani',
+    appIconId: 'floppybird',
+    systemAppId: 'floppybird',
+  },
+  {
+    id: 'curated-tetris',
+    title: 'Tetris Web Classic',
+    url: 'https://rawcdn.githack.com/jakesgordon/javascript-tetris/master/index.html',
+    desc: 'Pure HTML5/JS で遊べる王道クラシック・テトリス。',
+    iconChar: '🧱',
+    category: 'Game',
+    developer: 'Jake Gordon',
+    appIconId: 'cweb-tetris',
+  },
+  {
+    id: 'curated-react-tetris',
+    title: 'React Tetris (携帯ゲーム機風)',
+    url: 'https://chvin.github.io/react-tetris/',
+    desc: '懐かしの携帯LCDゲーム機を再現した高機能テトリス。',
+    iconChar: '🕹️',
+    category: 'Game',
+    developer: 'chvin',
+    appIconId: 'cweb-react-tetris',
+  },
+  {
+    id: 'curated-2048',
+    title: '2048',
+    url: 'https://gabrielecirulli.github.io/2048/',
+    desc: '同じ数字タイルを合体させて 2048 を目指す定番スライドパズル。',
+    iconChar: '🔢',
+    category: 'Game',
+    developer: 'Gabriele Cirulli',
+    appIconId: 'cweb-2048',
+  },
+  {
+    id: 'curated-2048-cupcakes',
+    title: '2048 Cupcakes',
+    url: 'https://0x0800.github.io/2048-CUPCAKES/',
+    desc: '可愛いスイーツを合体させて豪華なケーキを作る 2048 パズル。',
+    iconChar: '🧁',
+    category: 'Game',
+    developer: '0x0800',
+    appIconId: 'cweb-2048-cupcakes',
+  },
+  {
+    id: 'curated-doge2048',
+    title: 'Doge 2048',
+    url: 'https://doge2048.com/',
+    desc: '柴犬ミームのアニメーションタイルで遊ぶユーモア版 2048。',
+    iconChar: '🐕',
+    category: 'Game',
+    developer: 'Doge2048',
+    appIconId: 'cweb-doge2048',
+  },
+  {
+    id: 'curated-clumsy-bird',
+    title: 'Clumsy Bird',
+    url: 'https://ellisonleao.github.io/clumsy-bird/',
+    desc: 'HTML5製で軽快に遊べる横スクロール飛行アクションゲーム。',
+    iconChar: '🐤',
+    category: 'Game',
+    developer: 'Ellison Leão',
+    appIconId: 'cweb-clumsy-bird',
+  },
+  {
+    id: 'curated-pacman',
+    title: 'Google Pac-Man',
+    url: 'https://macek.github.io/google_pacman/',
+    desc: '迷路のドットを食べながらゴーストから逃げる名作パックマン。',
+    iconChar: '👾',
+    category: 'Game',
+    developer: 'macek / Namco Tribute',
+    appIconId: 'cweb-pacman',
+  },
+  {
+    id: 'curated-dino',
+    title: 'T-Rex Dino Runner',
+    url: 'https://wayou.github.io/t-rex-runner/',
+    desc: 'サボテンとプテラノドンを飛び越えて走り続ける恐竜ランナー。',
+    iconChar: '🦖',
+    category: 'Game',
+    developer: 'wayou',
+    appIconId: 'cweb-dino',
+  },
+  {
+    id: 'curated-hexgl',
+    title: 'HexGL (WebGL 3Dレース)',
+    url: 'https://hexgl.bkcore.com/play/',
+    desc: '近未来の反重力マシンで疾走する本格 WebGL ハイスピードレース。',
+    iconChar: '🚀',
+    category: 'Game',
+    developer: 'Thibaut Despoulain',
+    appIconId: 'cweb-hexgl',
+  },
+  {
+    id: 'curated-outrun-racer',
+    title: 'OutRun Retro Racer',
+    url: 'https://rawcdn.githack.com/jakesgordon/javascript-racer/master/v4.final.html',
+    desc: '疑似3D視点で高速道路を駆け抜けるクラシック・アーケードレース。',
+    iconChar: '🏁',
+    category: 'Game',
+    developer: 'Jake Gordon',
+    appIconId: 'cweb-outrun',
+  },
+  {
+    id: 'curated-tower',
+    title: 'Tower Building',
+    url: 'https://iamkun.github.io/tower_game/',
+    desc: 'タイミング良くフロアを落として超高層タワーを積み上げるゲーム。',
+    iconChar: '🏗️',
+    category: 'Game',
+    developer: 'iamkun',
+    appIconId: 'cweb-tower',
+  },
+  {
+    id: 'curated-alien-invasion',
+    title: 'Alien Invasion',
+    url: 'https://cykod.github.io/AlienInvasion/',
+    desc: '迫り来るエイリアン編隊を迎え撃つレトロ縦スクロールシューティング。',
+    iconChar: '🛸',
+    category: 'Game',
+    developer: 'cykod',
+    appIconId: 'cweb-alien',
+  },
+  {
+    id: 'curated-asteroids',
+    title: 'HTML5 Asteroids',
+    url: 'https://rawcdn.githack.com/dmcinnes/HTML5-Asteroids/master/index.html',
+    desc: 'ベクターグラフィックが美しい全方向宇宙シューティング名作。',
+    iconChar: '☄️',
+    category: 'Game',
+    developer: 'Doug McInnes',
+    appIconId: 'cweb-asteroids',
+  },
+  {
+    id: 'curated-space-huggers',
+    title: 'Space Huggers',
+    url: 'https://killedbyapixel.github.io/SpaceHuggers/',
+    desc: '破壊できるドット絵ステージを突き進む爽快ラン＆ガンアクション。',
+    iconChar: '💥',
+    category: 'Game',
+    developer: 'Frank Force',
+    appIconId: 'cweb-space-huggers',
+  },
+  {
+    id: 'curated-snakes',
+    title: 'JavaScript Snakes',
+    url: 'https://rawcdn.githack.com/jakesgordon/javascript-snakes/master/index.html',
+    desc: 'フルーツを食べてどんどん長くなる王道スネークゲーム。',
+    iconChar: '🐍',
+    category: 'Game',
+    developer: 'Jake Gordon',
+    appIconId: 'cweb-snakes',
+  },
+  {
+    id: 'curated-breakout',
+    title: 'Breakout Classic',
+    url: 'https://rawcdn.githack.com/jakesgordon/javascript-breakout/master/index.html',
+    desc: 'パドルでボールを跳ね返してカラフルなブロックを崩す名作。',
+    iconChar: '🏓',
+    category: 'Game',
+    developer: 'Jake Gordon',
+    appIconId: 'cweb-breakout',
+  },
+  {
+    id: 'curated-pong',
+    title: 'Pong Retro',
+    url: 'https://rawcdn.githack.com/jakesgordon/javascript-pong/master/index.html',
+    desc: '1人でも2人でも遊べる、ビデオゲームの原点ピンポン対戦。',
+    iconChar: '🎾',
+    category: 'Game',
+    developer: 'Jake Gordon',
+    appIconId: 'cweb-pong',
+  },
+  {
+    id: 'curated-boulderdash',
+    title: 'Boulder Dash JS',
+    url: 'https://rawcdn.githack.com/jakesgordon/javascript-boulderdash/master/index.html',
+    desc: '落石を避けながら地下迷宮のダイヤモンドを集めるパズルアクション。',
+    iconChar: '💎',
+    category: 'Game',
+    developer: 'Jake Gordon',
+    appIconId: 'cweb-boulderdash',
+  },
+  {
+    id: 'curated-minesweeper',
+    title: 'Minesweeper Classic',
+    url: 'https://nickarocho.github.io/minesweeper/',
+    desc: '数字をヒントに地雷原をクリアする定番思考ゲーム（マインスイーパー）。',
+    iconChar: '💣',
+    category: 'Game',
+    developer: 'Nick Arocho',
+    appIconId: 'cweb-minesweeper',
+  },
+  {
+    id: 'curated-emoji-minesweeper',
+    title: 'Emoji Minesweeper',
+    url: 'https://muan.github.io/emoji-minesweeper/',
+    desc: 'ポップな絵文字アイコンで楽しめる新感覚マインスイーパー。',
+    iconChar: '🚩',
+    category: 'Game',
+    developer: 'Mu-An Chiou',
+    appIconId: 'cweb-emoji-minesweeper',
+  },
+  {
+    id: 'curated-solitaire',
+    title: 'Solitaire JS (クロンダイク)',
+    url: 'https://bfa.github.io/solitaire-js/',
+    desc: 'スムーズなドラッグ操作で遊べる定番トランプ・ソリティア。',
+    iconChar: '🃏',
+    category: 'Game',
+    developer: 'bfa',
+    appIconId: 'cweb-solitaire',
+  },
+  {
+    id: 'curated-astray',
+    title: 'Astray 3D Maze',
+    url: 'https://wwwtyro.github.io/Astray/',
+    desc: 'WebGL の立体迷宮からゴールを目指して脱出する3Dパズルゲーム。',
+    iconChar: '🌀',
+    category: 'Game',
+    developer: 'Rye Terrell',
+    appIconId: 'cweb-astray',
+  },
+  {
+    id: 'curated-celeste',
+    title: 'Celeste Classic (PICO-8)',
+    url: 'https://celesteclassic.github.io/',
+    desc: 'ダッシュ＆壁ジャンプで雪山の頂上を目指す人気高難度プラットフォームゲーム。',
+    iconChar: '🏔️',
+    category: 'Game',
+    developer: 'Maddy Thorson & Noel Berry',
+    appIconId: 'cweb-celeste',
+  },
+  {
+    id: 'curated-0hh1',
+    title: '0h h1 ロジックパズル',
+    url: 'https://0hh1.com/',
+    desc: '赤と青の2色タイルをルール通りに埋めるシンプルで美しい論理パズル。',
+    iconChar: '🔴',
+    category: 'Game',
+    developer: 'Q42',
+    appIconId: 'cweb-0hh1',
+  },
+  {
+    id: 'curated-0hn0',
+    title: '0h n0 ロジックパズル',
+    url: 'https://0hn0.com/',
+    desc: '中央の数字が見える方向を数えてボードを完成させる数独風パズル。',
+    iconChar: '🔵',
+    category: 'Game',
+    developer: 'Q42',
+    appIconId: 'cweb-0hn0',
+  },
+  {
+    id: 'curated-cookie',
+    title: 'Cookie Clicker',
+    url: 'https://ozh.github.io/cookieclicker/',
+    desc: 'クッキーを焼いて工場や魔法で無限に生産量を増やす放置クリッカー。',
+    iconChar: '🍪',
+    category: 'Game',
+    developer: 'Orteil',
+    appIconId: 'cweb-cookie',
+  },
+  {
+    id: 'curated-darkroom',
+    title: 'A Dark Room',
+    url: 'https://adarkroom.doublespeakgames.com/',
+    desc: '暗い部屋の焚き火から物語と世界が広がる名作テキストサバイバルRPG。',
+    iconChar: '🔥',
+    category: 'Game',
+    developer: 'Doublespeak Games',
+    appIconId: 'cweb-darkroom',
+  },
+  {
+    id: 'curated-wordle',
+    title: 'Wordle Classic (Reactle)',
+    url: 'https://reactle.vercel.app/',
+    desc: '6回以内の推測で5文字の英単語を当てる世界的人気ワードパズル。',
+    iconChar: '🔤',
+    category: 'Game',
+    developer: 'Reactle',
+    appIconId: 'cweb-wordle',
+  },
+  {
+    id: 'curated-pixel',
+    title: 'Pixel Art Paint',
+    url: 'https://pixelcraft.web.app/',
+    desc: 'レトロな8-bit風ドット絵を楽しく描けるペイントアプリ。',
+    iconChar: '🎨',
+    category: 'Creative',
+    developer: 'PixelCraft',
+    appIconId: 'cweb-pixel',
   },
   {
     id: 'curated-flexbox',
     title: 'Flexbox Froggy',
     url: 'https://flexboxfroggy.com/',
-    desc: 'Learn CSS layout alignments by coding for cute frogs.',
+    desc: 'カエルたちを蓮の葉に導きながら CSS Flexbox を学べる学習ゲーム。',
     iconChar: '🐸',
     category: 'Education',
-    developer: 'Codepip'
+    developer: 'Codepip',
+    appIconId: 'cweb-flexbox',
   },
   {
     id: 'curated-emoji',
     title: 'Emoji Finder Studio',
     url: 'https://emojifinder.com/',
-    desc: 'Search, copy, and explore the entire Unicode emoji catalog.',
+    desc: 'Unicode 絵文字を検索・コピーしてすぐに使える便利ツール。',
     iconChar: '🔍',
     category: 'Utilities',
-    developer: 'EmojiFinder'
-  }
+    developer: 'EmojiFinder',
+    appIconId: 'cweb-emoji',
+  },
 ];
 
 export const NoobStoreApp: React.FC = () => {
@@ -89,6 +391,8 @@ export const NoobStoreApp: React.FC = () => {
   const [installedCustomApps, setInstalledCustomApps] = useState<InstalledCustomApp[]>([]);
   const [selectedApp, setSelectedApp] = useState<StoreAppInfo | null>(null);
   const [featuredIndex, setFeaturedIndex] = useState(0);
+  const [customFilter, setCustomFilter] = useState<'all' | 'games' | 'other'>('all');
+  const [customNotice, setCustomNotice] = useState<string | null>(null);
 
   // Download Progress State
   const [downloadProgress, setDownloadProgress] = useState<Record<string, number>>({});
@@ -99,13 +403,26 @@ export const NoobStoreApp: React.FC = () => {
   const [customTitle, setCustomTitle] = useState('');
   const [customIconChar, setCustomIconChar] = useState('🌐');
 
-  // Load installed apps
+  // Load installed apps (and migrate any legacy/flaky custom Web URLs automatically)
   const reloadInstalledApps = () => {
     setInstalledSystemApps(getInstalledSystemAppIds());
     try {
       const stored = localStorage.getItem('noobstore_installed_apps');
       if (stored) {
-        setInstalledCustomApps(JSON.parse(stored));
+        const parsed = JSON.parse(stored) as InstalledCustomApp[];
+        let mutated = false;
+        const migrated = parsed.map((app) => {
+          const normalized = normalizeCustomWebUrl(app.url);
+          if (normalized && normalized !== app.url) {
+            mutated = true;
+            return { ...app, url: normalized };
+          }
+          return app;
+        });
+        if (mutated) {
+          localStorage.setItem('noobstore_installed_apps', JSON.stringify(migrated));
+        }
+        setInstalledCustomApps(migrated);
       }
     } catch (e) {
       console.error(e);
@@ -209,25 +526,29 @@ export const NoobStoreApp: React.FC = () => {
   };
 
   // Custom Web App Install Handler
-  const handleInstallCustomWeb = (title: string, url: string, iconChar: string) => {
-    if (!title || !url) return;
+  const handleInstallCustomWeb = (title: string, url: string, iconChar: string, iconId?: string) => {
+    const normalizedUrl = normalizeCustomWebUrl(url);
+    if (!title || !normalizedUrl) return;
     let latest: InstalledCustomApp[] = [];
     try {
       const stored = localStorage.getItem('noobstore_installed_apps');
       if (stored) latest = JSON.parse(stored);
     } catch (e) {}
 
-    if (latest.some(a => a.url === url)) {
-      alert('このURLのアプリは既にインストールされています。');
+    if (latest.some(a => normalizeCustomWebUrl(a.url) === normalizedUrl)) {
+      setCustomNotice('このURLのアプリは既にインストールされています。');
+      setTimeout(() => setCustomNotice(null), 3000);
       return;
     }
 
+    const resolvedIconId = iconId || CURATED_URL_TO_ICON_ID[normalizedUrl] || CURATED_URL_TO_ICON_ID[url.trim()];
     const newId = 'custom-app-' + Date.now();
     const newApp: InstalledCustomApp = {
       id: newId,
       title: title.trim(),
-      url: url.trim(),
+      url: normalizedUrl,
       iconChar,
+      ...(resolvedIconId ? { iconId: resolvedIconId } : {}),
       installedAt: new Date().toISOString(),
     };
 
@@ -243,7 +564,7 @@ export const NoobStoreApp: React.FC = () => {
         id: newId,
         appId: newId,
         title: title.trim(),
-        icon: 'browser',
+        icon: resolvedIconId || (iconChar ? `custom-app-${iconChar}` : 'browser'),
         type: 'app',
         x: spot.x,
         y: spot.y,
@@ -277,7 +598,14 @@ export const NoobStoreApp: React.FC = () => {
   };
 
   // Filter apps based on search and tab
-  const featuredAppsList = SYSTEM_STORE_APPS.filter(a => ['minecraft', 'word', 'sprout', 'tetris', 'excel'].includes(a.id));
+  const featuredAppsList = SYSTEM_STORE_APPS.filter(a => ['racing', 'floppybird', 'minecraft', 'word', 'tetris'].includes(a.id));
+
+  const curatedGamesCount = CURATED_CUSTOM_APPS.filter(item => item.category === 'Game').length;
+  const visibleCuratedApps = CURATED_CUSTOM_APPS.filter(item => {
+    if (customFilter === 'games') return item.category === 'Game';
+    if (customFilter === 'other') return item.category !== 'Game';
+    return true;
+  });
 
   const filteredApps = SYSTEM_STORE_APPS.filter(app => {
     const matchesSearch = app.titleJa.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -647,8 +975,8 @@ export const NoobStoreApp: React.FC = () => {
                         className="bg-zinc-900/80 border border-zinc-800 hover:border-zinc-700/80 rounded-xl p-4 flex items-center justify-between transition-all"
                       >
                         <div className="flex items-center gap-4">
-                          <div className="w-12 h-12 rounded-xl bg-zinc-950 flex items-center justify-center text-xl border border-zinc-800">
-                            {app.iconChar || '🌐'}
+                          <div className="w-12 h-12 rounded-xl bg-zinc-950 flex items-center justify-center text-xl border border-zinc-800 p-1.5">
+                            <AppIcon id={resolveCustomAppIconId(app)} size={36} />
                           </div>
                           <div>
                             <h3 className="font-bold text-sm text-zinc-100">{app.title}</h3>
@@ -693,20 +1021,33 @@ export const NoobStoreApp: React.FC = () => {
                     <div className="flex gap-2">
                       <input
                         type="text"
-                        placeholder="https://example.com や GitHub の raw.githack URL..."
+                        placeholder="https://example.com や GitHub URL (自動でCDN変換されます)..."
                         value={urlInput}
                         onChange={(e) => setUrlInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && urlInput.trim()) {
+                            const normalized = normalizeCustomWebUrl(urlInput);
+                            if (normalized) {
+                              setSearchedUrl(normalized);
+                              setCustomTitle(deriveCustomAppTitleFromUrl(normalized));
+                            }
+                          }
+                        }}
                         className="flex-1 bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2 text-xs outline-none focus:border-blue-500"
                       />
                       <button
                         onClick={() => {
                           if (!urlInput.trim()) return;
-                          let u = urlInput.trim();
-                          if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
-                          setSearchedUrl(u);
-                          setCustomTitle('カスタムアプリ');
+                          const normalized = normalizeCustomWebUrl(urlInput);
+                          if (!normalized) {
+                            setCustomNotice('有効な Web アプリ URL を入力してください。');
+                            setTimeout(() => setCustomNotice(null), 3000);
+                            return;
+                          }
+                          setSearchedUrl(normalized);
+                          setCustomTitle(deriveCustomAppTitleFromUrl(normalized));
                         }}
-                        className="bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs px-5 py-2 rounded-xl"
+                        className="bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs px-5 py-2 rounded-xl whitespace-nowrap"
                       >
                         読み込み
                       </button>
@@ -746,34 +1087,121 @@ export const NoobStoreApp: React.FC = () => {
                   )}
                 </div>
 
+                {customNotice && (
+                  <div className="px-4 py-2.5 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-200 text-xs font-medium">
+                    {customNotice}
+                  </div>
+                )}
+
                 {/* Curated Recommendations */}
-                <div className="space-y-3">
-                  <h3 className="text-sm font-bold text-zinc-200">おすすめの Web アプリ カタログ</h3>
+                <div className="space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-2.5">
+                      <h3 className="text-sm font-bold text-zinc-200">おすすめの Web アプリ カタログ</h3>
+                      <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-md bg-blue-500/15 text-blue-300 border border-blue-500/30">
+                        ゲーム {curatedGamesCount} 本収録
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => setCustomFilter('all')}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                          customFilter === 'all'
+                            ? 'bg-blue-600 text-white'
+                            : 'bg-zinc-900 text-zinc-400 hover:text-zinc-100 border border-zinc-800'
+                        }`}
+                      >
+                        すべて ({CURATED_CUSTOM_APPS.length})
+                      </button>
+                      <button
+                        onClick={() => setCustomFilter('games')}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                          customFilter === 'games'
+                            ? 'bg-blue-600 text-white'
+                            : 'bg-zinc-900 text-zinc-400 hover:text-zinc-100 border border-zinc-800'
+                        }`}
+                      >
+                        ゲーム ({curatedGamesCount})
+                      </button>
+                      <button
+                        onClick={() => setCustomFilter('other')}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                          customFilter === 'other'
+                            ? 'bg-blue-600 text-white'
+                            : 'bg-zinc-900 text-zinc-400 hover:text-zinc-100 border border-zinc-800'
+                        }`}
+                      >
+                        ツール・学習 ({CURATED_CUSTOM_APPS.length - curatedGamesCount})
+                      </button>
+                    </div>
+                  </div>
+
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {CURATED_CUSTOM_APPS.map((item) => {
-                      const isInst = installedCustomApps.some(a => a.url === item.url);
+                    {visibleCuratedApps.map((item) => {
+                      const linkedSysApp = item.systemAppId
+                        ? SYSTEM_STORE_APPS.find(a => a.id === item.systemAppId)
+                        : undefined;
+                      const installedCustomMatch = installedCustomApps.find(
+                        a => normalizeCustomWebUrl(a.url) === normalizeCustomWebUrl(item.url)
+                      );
+                      const isInst =
+                        (item.systemAppId ? installedSystemApps.includes(item.systemAppId) : false) ||
+                        Boolean(installedCustomMatch);
+
                       return (
                         <div
                           key={item.id}
-                          className="bg-zinc-900/80 border border-zinc-800 rounded-xl p-4 flex items-center justify-between"
+                          className="bg-zinc-900/80 border border-zinc-800 hover:border-zinc-700/80 rounded-xl p-4 flex items-center justify-between gap-3 transition-colors"
                         >
-                          <div className="flex items-center gap-3">
-                            <div className="w-10 h-10 rounded-xl bg-zinc-950 flex items-center justify-center text-lg border border-zinc-800">
-                              {item.iconChar}
+                          <div className="flex items-center gap-3 min-w-0">
+                            <div className="w-12 h-12 rounded-xl bg-zinc-950 flex items-center justify-center border border-zinc-800 shrink-0 p-1.5">
+                              <AppIcon id={item.appIconId || `custom-app-${item.iconChar}`} size={36} />
                             </div>
-                            <div>
-                              <h4 className="font-bold text-xs text-white">{item.title}</h4>
-                              <p className="text-[11px] text-zinc-400 leading-tight">{item.desc}</p>
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <h4 className="font-bold text-xs text-white truncate">{item.title}</h4>
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 shrink-0">
+                                  {item.category === 'Game' ? 'ゲーム' : item.developer}
+                                </span>
+                              </div>
+                              <p className="text-[11px] text-zinc-400 leading-snug mt-0.5 line-clamp-2">{item.desc}</p>
                             </div>
                           </div>
 
                           {isInst ? (
-                            <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-3 py-1 rounded-full font-bold">
-                              追加済み
-                            </span>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              {item.systemAppId && installedSystemApps.includes(item.systemAppId) ? (
+                                <button
+                                  onClick={() => handleLaunchApp(item.systemAppId!)}
+                                  className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-3 py-1.5 rounded-lg flex items-center gap-1"
+                                >
+                                  <Play className="w-3 h-3 fill-current" />
+                                  起動
+                                </button>
+                              ) : installedCustomMatch ? (
+                                <button
+                                  onClick={() => handleLaunchApp(installedCustomMatch.id)}
+                                  className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-3 py-1.5 rounded-lg flex items-center gap-1"
+                                >
+                                  <Play className="w-3 h-3 fill-current" />
+                                  起動
+                                </button>
+                              ) : (
+                                <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-3 py-1 rounded-md font-bold">
+                                  追加済み
+                                </span>
+                              )}
+                            </div>
                           ) : (
                             <button
-                              onClick={() => handleInstallCustomWeb(item.title, item.url, item.iconChar)}
+                              onClick={() => {
+                                if (linkedSysApp) {
+                                  handleInstallSystemApp(linkedSysApp);
+                                } else {
+                                  handleInstallCustomWeb(item.title, item.url, item.iconChar, item.appIconId);
+                                }
+                              }}
                               className="bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs px-3 py-1.5 rounded-lg shrink-0"
                             >
                               追加

@@ -1,4 +1,5 @@
 import React from 'react';
+import { renderCustomWebAppIcon } from './CustomAppIcons';
 
 interface AppIconProps {
   id: string;
@@ -8,12 +9,25 @@ interface AppIconProps {
 
 export const AppIcon: React.FC<AppIconProps> = ({ id, className = '', size = 32 }) => {
   const getIcon = () => {
+    const customSvg = renderCustomWebAppIcon(id);
+    if (customSvg) {
+      return customSvg;
+    }
     if (id.startsWith('custom-app-')) {
       const emoji = id.replace('custom-app-', '') || '🌐';
       return (
-        <div className="w-full h-full flex items-center justify-center bg-gradient-to-tr from-amber-500 via-orange-500 to-red-600 rounded-xl shadow-md text-white text-xl font-bold select-none border border-white/20">
-          {emoji}
-        </div>
+        <svg viewBox="0 0 100 100" className="w-full h-full drop-shadow-sm">
+          <defs>
+            <linearGradient id="customWebTileGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stopColor="#3b82f6" />
+              <stop offset="55%" stopColor="#6366f1" />
+              <stop offset="100%" stopColor="#8b5cf6" />
+            </linearGradient>
+          </defs>
+          <rect x="10" y="10" width="80" height="80" rx="20" fill="url(#customWebTileGrad)" stroke="#ffffff" strokeOpacity="0.25" strokeWidth="1.5" />
+          <path d="M 10 30 Q 50 18 90 30 L 90 22 Q 90 10 78 10 L 22 10 Q 10 10 10 22 Z" fill="#ffffff" opacity="0.16" />
+          <text x="50" y="64" fontSize="38" textAnchor="middle" dominantBaseline="central">{emoji}</text>
+        </svg>
       );
     }
     switch (id) {
@@ -789,6 +803,171 @@ export const AppIcon: React.FC<AppIconProps> = ({ id, className = '', size = 32 
             </g>
             <rect x="58" y="62" width="24" height="14" rx="4" fill="#064e3b" stroke="#34d399" strokeWidth="1" />
             <text x="70" y="72" fontSize="9" fill="#34d399" textAnchor="middle" fontWeight="bold" fontFamily="monospace">.SP</text>
+          </svg>
+        );
+
+      case 'vscode':
+        return (
+          <svg viewBox="0 0 100 100" className="w-full h-full drop-shadow-sm">
+            <defs>
+              <linearGradient id="vscodeBg" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stopColor="#1e293b" />
+                <stop offset="100%" stopColor="#0f172a" />
+              </linearGradient>
+              <linearGradient id="vscodeRibbon" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stopColor="#38bdf8" />
+                <stop offset="100%" stopColor="#007acc" />
+              </linearGradient>
+            </defs>
+            <rect x="10" y="10" width="80" height="80" rx="18" fill="url(#vscodeBg)" stroke="#334155" strokeWidth="2" />
+            <path d="M 69 24 L 80 30 L 80 70 L 69 76 L 69 24 Z" fill="#0065a9" />
+            <path d="M 69 24 L 31 59 L 21 51 L 69 24 Z" fill="#007acc" />
+            <path d="M 69 76 L 31 41 L 21 49 L 69 76 Z" fill="url(#vscodeRibbon)" />
+            <path d="M 69 24 L 69 76 L 80 70 L 80 30 Z" fill="#1f9cf0" fillOpacity="0.88" />
+          </svg>
+        );
+
+      case 'racing':
+        return (
+          <svg viewBox="0 0 100 100" className="w-full h-full drop-shadow-sm">
+            <defs>
+              <linearGradient id="racingBgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stopColor="#18181b" />
+                <stop offset="100%" stopColor="#3f1d28" />
+              </linearGradient>
+              <linearGradient id="racingCarGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stopColor="#ff3b30" />
+                <stop offset="55%" stopColor="#dc2626" />
+                <stop offset="100%" stopColor="#991b1b" />
+              </linearGradient>
+              <linearGradient id="racingTrackGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stopColor="#3f3f46" />
+                <stop offset="100%" stopColor="#18181b" />
+              </linearGradient>
+            </defs>
+            {/* Rounded Dark Carbon Backdrop */}
+            <rect x="10" y="10" width="80" height="80" rx="20" fill="url(#racingBgGrad)" stroke="#ef4444" strokeWidth="1.5" strokeOpacity="0.45" />
+            {/* Perspective Asphalt Track & Curbs */}
+            <path d="M 32 14 L 68 14 L 84 86 L 16 86 Z" fill="url(#racingTrackGrad)" opacity="0.85" />
+            <path d="M 50 18 L 50 28 M 50 36 L 50 48 M 50 58 L 50 72" stroke="#fde047" strokeWidth="3" strokeLinecap="round" opacity="0.65" />
+            {/* Checkered Corner Ribbon Accent */}
+            <g opacity="0.9">
+              <rect x="16" y="16" width="6" height="6" fill="#ffffff" rx="1" />
+              <rect x="22" y="16" width="6" height="6" fill="#18181b" rx="1" />
+              <rect x="16" y="22" width="6" height="6" fill="#18181b" rx="1" />
+              <rect x="22" y="22" width="6" height="6" fill="#ffffff" rx="1" />
+            </g>
+            {/* Top-Down Formula / GT Race Car */}
+            {/* Wheels */}
+            <rect x="27" y="34" width="9" height="14" rx="3" fill="#09090b" stroke="#52525b" strokeWidth="1" />
+            <rect x="64" y="34" width="9" height="14" rx="3" fill="#09090b" stroke="#52525b" strokeWidth="1" />
+            <rect x="25" y="58" width="10" height="16" rx="3" fill="#09090b" stroke="#52525b" strokeWidth="1" />
+            <rect x="65" y="58" width="10" height="16" rx="3" fill="#09090b" stroke="#52525b" strokeWidth="1" />
+            {/* Front Wing */}
+            <path d="M 28 32 Q 50 24 72 32 L 70 37 Q 50 32 30 37 Z" fill="#ef4444" stroke="#fca5a5" strokeWidth="0.8" />
+            {/* Chassis Body */}
+            <path d="M 43 26 Q 50 21 57 26 L 63 50 L 65 72 Q 50 76 35 72 L 37 50 Z" fill="url(#racingCarGrad)" />
+            {/* Center White Racing Stripe */}
+            <path d="M 47.5 24 L 52.5 24 L 53.5 73 L 46.5 73 Z" fill="#ffffff" opacity="0.92" />
+            {/* Cockpit Canopy */}
+            <ellipse cx="50" cy="52" rx="6.5" ry="10" fill="#0f172a" stroke="#38bdf8" strokeWidth="1.2" />
+            <ellipse cx="50" cy="49" rx="3.5" ry="4" fill="#38bdf8" opacity="0.5" />
+            {/* Rear Spoiler */}
+            <rect x="30" y="73" width="40" height="7" rx="2.5" fill="#7f1d1d" stroke="#fca5a5" strokeWidth="0.9" />
+            {/* Twin Headlight Glows */}
+            <circle cx="38" cy="31" r="2.2" fill="#fef08a" />
+            <circle cx="62" cy="31" r="2.2" fill="#fef08a" />
+          </svg>
+        );
+
+      case 'floppybird':
+        return (
+          <svg viewBox="0 0 100 100" className="w-full h-full drop-shadow-sm">
+            <defs>
+              <linearGradient id="floppySkyGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stopColor="#38bdf8" />
+                <stop offset="70%" stopColor="#7dd3fc" />
+                <stop offset="100%" stopColor="#bae6fd" />
+              </linearGradient>
+              <linearGradient id="floppyPipeGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stopColor="#4ade80" />
+                <stop offset="50%" stopColor="#22c55e" />
+                <stop offset="100%" stopColor="#15803d" />
+              </linearGradient>
+              <linearGradient id="floppyBirdGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stopColor="#fde047" />
+                <stop offset="65%" stopColor="#facc15" />
+                <stop offset="100%" stopColor="#eab308" />
+              </linearGradient>
+            </defs>
+            {/* Sky Backdrop */}
+            <rect x="10" y="10" width="80" height="80" rx="20" fill="url(#floppySkyGrad)" stroke="#0284c7" strokeWidth="1.5" strokeOpacity="0.4" />
+            {/* Fluffy Cloud */}
+            <g fill="#ffffff" opacity="0.88">
+              <circle cx="28" cy="32" r="7" />
+              <circle cx="37" cy="29" r="9" />
+              <circle cx="46" cy="33" r="6" />
+            </g>
+            {/* Top Green Pipe */}
+            <rect x="64" y="10" width="16" height="19" fill="url(#floppyPipeGrad)" stroke="#14532d" strokeWidth="1.5" />
+            <rect x="61" y="25" width="22" height="7" rx="2" fill="url(#floppyPipeGrad)" stroke="#14532d" strokeWidth="1.5" />
+            {/* Bottom Green Pipe */}
+            <rect x="64" y="69" width="16" height="21" fill="url(#floppyPipeGrad)" stroke="#14532d" strokeWidth="1.5" />
+            <rect x="61" y="64" width="22" height="7" rx="2" fill="url(#floppyPipeGrad)" stroke="#14532d" strokeWidth="1.5" />
+            {/* Ground Grass Strip */}
+            <path d="M 10 81 L 90 81 L 90 82 Q 90 90 80 90 L 20 90 Q 10 90 10 82 Z" fill="#84cc16" stroke="#365314" strokeWidth="1" />
+            {/* Iconic Bird Body */}
+            <ellipse cx="44" cy="51" rx="18" ry="15" fill="url(#floppyBirdGrad)" stroke="#422006" strokeWidth="2.2" />
+            {/* Belly Highlight */}
+            <path d="M 32 56 Q 43 64 55 57" fill="none" stroke="#fef9c3" strokeWidth="2.5" strokeLinecap="round" opacity="0.7" />
+            {/* Wing */}
+            <ellipse cx="35" cy="52" rx="8.5" ry="6" fill="#fefce8" stroke="#422006" strokeWidth="2" transform="rotate(-10 35 52)" />
+            {/* Big Expressive Eye */}
+            <circle cx="52" cy="45" r="6.2" fill="#ffffff" stroke="#422006" strokeWidth="1.8" />
+            <circle cx="54" cy="45" r="2.5" fill="#09090b" />
+            <circle cx="54.8" cy="43.8" r="0.9" fill="#ffffff" />
+            {/* Orange Beak */}
+            <path d="M 56 50 L 70 52 L 56 56 Z" fill="#f97316" stroke="#422006" strokeWidth="1.8" strokeLinejoin="round" />
+            <path d="M 56 55 L 67 57 L 56 59 Z" fill="#ea580c" stroke="#422006" strokeWidth="1.6" strokeLinejoin="round" />
+          </svg>
+        );
+
+      case 'geoguessr':
+        return (
+          <svg viewBox="0 0 100 100" className="w-full h-full drop-shadow-sm">
+            <defs>
+              <linearGradient id="geoBgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stopColor="#0f172a" />
+                <stop offset="100%" stopColor="#064e3b" />
+              </linearGradient>
+              <linearGradient id="geoOceanGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stopColor="#0ea5e9" />
+                <stop offset="100%" stopColor="#0369a1" />
+              </linearGradient>
+              <linearGradient id="geoPinGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stopColor="#f43f5e" />
+                <stop offset="100%" stopColor="#e11d48" />
+              </linearGradient>
+            </defs>
+            <rect x="10" y="10" width="80" height="80" rx="20" fill="url(#geoBgGrad)" stroke="#10b981" strokeOpacity="0.4" strokeWidth="1.5" />
+            {/* Globe Base */}
+            <circle cx="50" cy="54" r="28" fill="url(#geoOceanGrad)" stroke="#bae6fd" strokeWidth="1.5" strokeOpacity="0.5" />
+            {/* Stylized Continents */}
+            <path d="M 30 46 Q 36 38 45 43 Q 48 52 40 58 Q 33 63 30 55 Z" fill="#22c55e" />
+            <path d="M 52 38 Q 64 36 70 46 Q 68 58 58 60 Q 52 55 54 46 Z" fill="#16a34a" />
+            <path d="M 46 63 Q 56 64 60 72 Q 52 77 45 73 Z" fill="#4ade80" />
+            {/* Latitude / Longitude Rings */}
+            <ellipse cx="50" cy="54" rx="28" ry="10" fill="none" stroke="#ffffff" strokeWidth="1" strokeOpacity="0.25" />
+            <ellipse cx="50" cy="54" rx="12" ry="28" fill="none" stroke="#ffffff" strokeWidth="1" strokeOpacity="0.25" />
+            {/* Signature Geo Pin */}
+            <path
+              d="M 50 16 C 39 16 31 24 31 35 C 31 48 50 65 50 65 C 50 65 69 48 69 35 C 69 24 61 16 50 16 Z"
+              fill="url(#geoPinGrad)"
+              stroke="#ffffff"
+              strokeWidth="2.2"
+            />
+            <circle cx="50" cy="34" r="7" fill="#ffffff" />
+            <circle cx="50" cy="34" r="3.2" fill="#f59e0b" />
           </svg>
         );
 

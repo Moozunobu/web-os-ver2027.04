@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Play, RotateCcw, Volume2, VolumeX, Cpu, Users, User, ArrowRight, ArrowLeft, ArrowUp, ArrowDown, HelpCircle } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { createClient } from '@supabase/supabase-js';
+import { createWsRoomChannel, WsRoomChannel } from '../../utils/wsRelay';
 
 export interface Opponent {
   id: string;
@@ -11,10 +11,6 @@ export interface Opponent {
   isGameOver: boolean;
   lastActive: number;
 }
-
-// --- Supabase Credentials ---
-const SUPABASE_URL = 'https://nsyvlftqcciyetsbhymg.supabase.co';
-const SUPABASE_ANON_KEY = 'sb_publishable_lkhrFuMlNyEmUX4RTFApKw_AhD1sAkV';
 
 const getSRSKicks = (pieceId: number, fromRot: number, toRot: number): { dx: number; dy: number }[] => {
   if (pieceId === 4) { // O-piece
@@ -147,35 +143,23 @@ export function TetrisApp() {
   const wsRef = useRef<WebSocket | null>(null);
   const [roomId, setRoomId] = useState<string | null>(null);
 
-  // --- Online Multiplayer State (Supabase) ---
+  // --- Online Multiplayer State (WebSocket Relay) ---
   const [onlineRoomCode, setOnlineRoomCode] = useState<string>('');
   const [onlineIsCreator, setOnlineIsCreator] = useState<boolean>(false);
   const [onlinePlayerId, setOnlinePlayerId] = useState<'p1' | 'p2'>('p1');
   const [onlineStatusText, setOnlineStatusText] = useState<string>('');
   const [onlineErrorText, setOnlineErrorText] = useState<string>('');
   const [onlineSetupState, setOnlineSetupState] = useState<'menu' | 'setup' | 'room' | 'playing'>('menu');
-  const supabaseRef = useRef<any>(null);
-  const channelRef = useRef<any>(null);
+  const channelRef = useRef<WsRoomChannel | null>(null);
 
   // --- Up to 5 Players Multiplayer State ---
   const myPlayerId = useRef<string>('p_' + Math.random().toString(36).substr(2, 6));
   const myUsername = localStorage.getItem('wetalks_logged_in_user') || 'Player_' + Math.random().toString(36).substr(2, 4);
   const [opponents, setOpponents] = useState<Record<string, Opponent>>({});
 
-  const getSupabaseClient = () => {
-    if (supabaseRef.current) return supabaseRef.current;
-    try {
-      const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-      supabaseRef.current = client;
-      return client;
-    } catch (err) {
-      console.error('Supabase init failed:', err);
-      return null;
-    }
-  };
-
   // References for game loop
   const gridRef = useRef<number[][]>(grid);
+  const scoreRef = useRef<number>(0);
   const activePieceRef = useRef<ActivePiece | null>(null);
   const holdPieceRef = useRef<number | null>(null);
   const hasHeldRef = useRef<boolean>(false);
@@ -191,6 +175,7 @@ export function TetrisApp() {
 
   // Sync references
   useEffect(() => { gridRef.current = grid; }, [grid]);
+  useEffect(() => { scoreRef.current = score; }, [score]);
   useEffect(() => { activePieceRef.current = activePiece; }, [activePiece]);
   useEffect(() => { holdPieceRef.current = holdPiece; }, [holdPiece]);
   useEffect(() => { hasHeldRef.current = hasHeld; }, [hasHeld]);
@@ -203,10 +188,12 @@ export function TetrisApp() {
       if (lockDelayTimeoutRef.current) {
         clearTimeout(lockDelayTimeoutRef.current);
       }
-      if (channelRef.current && supabaseRef.current) {
+      if (channelRef.current) {
         try {
-          supabaseRef.current.removeChannel(channelRef.current);
+          channelRef.current.send({ event: 'tetris_leave', payload: { playerId: myPlayerId.current } });
+          channelRef.current.unsubscribe();
         } catch (e) {}
+        channelRef.current = null;
       }
     };
   }, []);
@@ -454,239 +441,229 @@ export function TetrisApp() {
 
   // Lock active piece onto grid, check for line clears, and update stats
   const lockPiece = useCallback((piece: ActivePiece) => {
-    setGrid((prevGrid) => {
-      const nextGrid = prevGrid.map((row) => [...row]);
-      
-      // Place piece
-      for (let r = 0; r < piece.shape.length; r++) {
-        for (let c = 0; c < piece.shape[r].length; c++) {
-          if (piece.shape[r][c] !== 0) {
-            const boardY = piece.y + r;
-            const boardX = piece.x + c;
-            if (boardY >= 0 && boardY < 20 && boardX >= 0 && boardX < 10) {
-              nextGrid[boardY][boardX] = piece.id;
-            }
+    const prevGrid = gridRef.current;
+    const nextGrid = prevGrid.map((row) => [...row]);
+
+    // Place piece
+    for (let r = 0; r < piece.shape.length; r++) {
+      for (let c = 0; c < piece.shape[r].length; c++) {
+        if (piece.shape[r][c] !== 0) {
+          const boardY = piece.y + r;
+          const boardX = piece.x + c;
+          if (boardY >= 0 && boardY < 20 && boardX >= 0 && boardX < 10) {
+            nextGrid[boardY][boardX] = piece.id;
           }
         }
       }
+    }
 
-      // T-spin detection
-      let isTSpin = false;
-      let isMini = false;
-      if (piece.id === 6 && lastActionWasRotateRef.current) {
-        const cy = piece.y + 1;
-        const cx = piece.x + 1;
+    // T-spin detection
+    let isTSpin = false;
+    let isMini = false;
+    if (piece.id === 6 && lastActionWasRotateRef.current) {
+      const cy = piece.y + 1;
+      const cx = piece.x + 1;
 
-        let occupiedCorners = 0;
-        if (isCornerOccupied(nextGrid, cx - 1, cy - 1)) occupiedCorners++; // Top-Left
-        if (isCornerOccupied(nextGrid, cx + 1, cy - 1)) occupiedCorners++; // Top-Right
-        if (isCornerOccupied(nextGrid, cx - 1, cy + 1)) occupiedCorners++; // Bottom-Left
-        if (isCornerOccupied(nextGrid, cx + 1, cy + 1)) occupiedCorners++; // Bottom-Right
+      let occupiedCorners = 0;
+      if (isCornerOccupied(nextGrid, cx - 1, cy - 1)) occupiedCorners++;
+      if (isCornerOccupied(nextGrid, cx + 1, cy - 1)) occupiedCorners++;
+      if (isCornerOccupied(nextGrid, cx - 1, cy + 1)) occupiedCorners++;
+      if (isCornerOccupied(nextGrid, cx + 1, cy + 1)) occupiedCorners++;
 
-        if (occupiedCorners >= 3) {
-          isTSpin = true;
-          
-          // Check if it's a T-Spin Mini based on standard front-corner rule:
-          // The pointing tip of T-piece (rotation 0=UP, 1=RIGHT, 2=DOWN, 3=LEFT)
-          // must have BOTH front corners occupied to be a full T-Spin. Otherwise it's Mini.
-          let frontCorners = 0;
-          if (piece.rotation === 0) { // pointing UP
-            if (isCornerOccupied(nextGrid, cx - 1, cy - 1)) frontCorners++;
-            if (isCornerOccupied(nextGrid, cx + 1, cy - 1)) frontCorners++;
-          } else if (piece.rotation === 1) { // pointing RIGHT
-            if (isCornerOccupied(nextGrid, cx + 1, cy - 1)) frontCorners++;
-            if (isCornerOccupied(nextGrid, cx + 1, cy + 1)) frontCorners++;
-          } else if (piece.rotation === 2) { // pointing DOWN
-            if (isCornerOccupied(nextGrid, cx - 1, cy + 1)) frontCorners++;
-            if (isCornerOccupied(nextGrid, cx + 1, cy + 1)) frontCorners++;
-          } else if (piece.rotation === 3) { // pointing LEFT
-            if (isCornerOccupied(nextGrid, cx - 1, cy - 1)) frontCorners++;
-            if (isCornerOccupied(nextGrid, cx - 1, cy + 1)) frontCorners++;
-          }
-          isMini = frontCorners < 2;
+      if (occupiedCorners >= 3) {
+        isTSpin = true;
+
+        let frontCorners = 0;
+        if (piece.rotation === 0) {
+          if (isCornerOccupied(nextGrid, cx - 1, cy - 1)) frontCorners++;
+          if (isCornerOccupied(nextGrid, cx + 1, cy - 1)) frontCorners++;
+        } else if (piece.rotation === 1) {
+          if (isCornerOccupied(nextGrid, cx + 1, cy - 1)) frontCorners++;
+          if (isCornerOccupied(nextGrid, cx + 1, cy + 1)) frontCorners++;
+        } else if (piece.rotation === 2) {
+          if (isCornerOccupied(nextGrid, cx - 1, cy + 1)) frontCorners++;
+          if (isCornerOccupied(nextGrid, cx + 1, cy + 1)) frontCorners++;
+        } else if (piece.rotation === 3) {
+          if (isCornerOccupied(nextGrid, cx - 1, cy - 1)) frontCorners++;
+          if (isCornerOccupied(nextGrid, cx - 1, cy + 1)) frontCorners++;
         }
+        isMini = frontCorners < 2;
       }
+    }
 
-      // Detect fully cleared rows
-      let linesCleared = 0;
-      const filteredGrid = nextGrid.filter((row) => {
-        const isFull = row.every((cell) => cell !== 0);
-        if (isFull) linesCleared++;
-        return !isFull;
-      });
+    // Detect fully cleared rows
+    let linesCleared = 0;
+    const filteredGrid = nextGrid.filter((row) => {
+      const isFull = row.every((cell) => cell !== 0);
+      if (isFull) linesCleared++;
+      return !isFull;
+    });
 
-      // Refill top with empty rows
-      while (filteredGrid.length < 20) {
-        filteredGrid.unshift(Array(10).fill(0));
-      }
+    while (filteredGrid.length < 20) {
+      filteredGrid.unshift(Array(10).fill(0));
+    }
 
-      // Combo evaluation
-      let nextCombo = comboRef.current;
-      if (linesCleared > 0) {
-        nextCombo++;
-      } else {
-        nextCombo = 0;
-      }
-      comboRef.current = nextCombo;
-      setCombo(nextCombo);
+    gridRef.current = filteredGrid;
+    setGrid(filteredGrid);
 
-      // Score and special message determination
-      let gain = 0;
-      let messageText = '';
-      let messageColor = '';
+    // Combo evaluation
+    let nextCombo = comboRef.current;
+    if (linesCleared > 0) {
+      nextCombo++;
+    } else {
+      nextCombo = 0;
+    }
+    comboRef.current = nextCombo;
+    setCombo(nextCombo);
 
-      if (isTSpin) {
-        if (isMini) {
-          if (linesCleared === 0) {
-            gain = 100 * level;
-            messageText = 'T-SPIN MINI!';
-            messageColor = 'text-fuchsia-400 bg-fuchsia-950/60 border border-fuchsia-500/40 shadow-lg shadow-fuchsia-500/20';
-          } else if (linesCleared === 1) {
-            gain = 200 * level;
-            messageText = 'T-SPIN MINI SINGLE!';
-            messageColor = 'text-fuchsia-400 bg-fuchsia-950/60 border border-fuchsia-500/40 shadow-lg shadow-fuchsia-500/20';
-          } else if (linesCleared === 2) {
-            gain = 400 * level;
-            messageText = 'T-SPIN MINI DOUBLE!';
-            messageColor = 'text-fuchsia-400 bg-fuchsia-950/60 border border-fuchsia-500/40 shadow-lg shadow-fuchsia-500/20';
-          }
-        } else {
-          if (linesCleared === 0) {
-            gain = 400 * level;
-            messageText = 'T-SPIN!';
-            messageColor = 'text-purple-400 bg-purple-950/60 border border-purple-500/40 shadow-lg shadow-purple-500/20';
-          } else if (linesCleared === 1) {
-            gain = 800 * level;
-            messageText = 'T-SPIN SINGLE!';
-            messageColor = 'text-cyan-400 bg-cyan-950/60 border border-cyan-500/40 shadow-lg shadow-cyan-500/20';
-          } else if (linesCleared === 2) {
-            gain = 1200 * level;
-            messageText = 'T-SPIN DOUBLE!';
-            messageColor = 'text-amber-400 bg-amber-950/60 border border-amber-500/40 shadow-lg shadow-amber-500/20';
-          } else if (linesCleared >= 3) {
-            gain = 1600 * level;
-            messageText = 'T-SPIN TRIPLE!';
-            messageColor = 'text-red-400 bg-red-950/60 border border-red-500/40 shadow-lg shadow-red-500/20';
-          }
+    // Score and special message determination
+    let gain = 0;
+    let messageText = '';
+    let messageColor = '';
+
+    if (isTSpin) {
+      if (isMini) {
+        if (linesCleared === 0) {
+          gain = 100 * level;
+          messageText = 'T-SPIN MINI!';
+          messageColor = 'text-fuchsia-400 bg-fuchsia-950/60 border border-fuchsia-500/40 shadow-lg shadow-fuchsia-500/20';
+        } else if (linesCleared === 1) {
+          gain = 200 * level;
+          messageText = 'T-SPIN MINI SINGLE!';
+          messageColor = 'text-fuchsia-400 bg-fuchsia-950/60 border border-fuchsia-500/40 shadow-lg shadow-fuchsia-500/20';
+        } else if (linesCleared === 2) {
+          gain = 400 * level;
+          messageText = 'T-SPIN MINI DOUBLE!';
+          messageColor = 'text-fuchsia-400 bg-fuchsia-950/60 border border-fuchsia-500/40 shadow-lg shadow-fuchsia-500/20';
         }
       } else {
-        if (linesCleared === 4) {
+        if (linesCleared === 0) {
+          gain = 400 * level;
+          messageText = 'T-SPIN!';
+          messageColor = 'text-purple-400 bg-purple-950/60 border border-purple-500/40 shadow-lg shadow-purple-500/20';
+        } else if (linesCleared === 1) {
           gain = 800 * level;
-          messageText = 'TETRIS!';
-          messageColor = 'text-pink-400 bg-pink-950/60 border border-pink-500/40 shadow-lg shadow-pink-500/20';
-        } else if (linesCleared > 0) {
-          const blocksInRow = 10;
-          const totalBlocksCleared = linesCleared * blocksInRow;
-          const scorePerBlock = 10; // 10 points per block, so 100 points per row
-          gain = totalBlocksCleared * scorePerBlock * level;
+          messageText = 'T-SPIN SINGLE!';
+          messageColor = 'text-cyan-400 bg-cyan-950/60 border border-cyan-500/40 shadow-lg shadow-cyan-500/20';
+        } else if (linesCleared === 2) {
+          gain = 1200 * level;
+          messageText = 'T-SPIN DOUBLE!';
+          messageColor = 'text-amber-400 bg-amber-950/60 border border-amber-500/40 shadow-lg shadow-amber-500/20';
+        } else if (linesCleared >= 3) {
+          gain = 1600 * level;
+          messageText = 'T-SPIN TRIPLE!';
+          messageColor = 'text-red-400 bg-red-950/60 border border-red-500/40 shadow-lg shadow-red-500/20';
         }
       }
-
-      // Add combo score bonus
-      let comboBonus = 0;
-      if (linesCleared > 0 && nextCombo > 1) {
-        comboBonus = 50 * (nextCombo - 1) * level;
-        gain += comboBonus;
+    } else {
+      if (linesCleared === 4) {
+        gain = 800 * level;
+        messageText = 'TETRIS!';
+        messageColor = 'text-pink-400 bg-pink-950/60 border border-pink-500/40 shadow-lg shadow-pink-500/20';
+      } else if (linesCleared > 0) {
+        gain = linesCleared * 100 * level;
       }
+    }
 
-      if (gain > 0) {
-        setScore((prev) => prev + gain);
-      }
+    if (linesCleared > 0 && nextCombo > 1) {
+      gain += 50 * (nextCombo - 1) * level;
+    }
 
-      if (linesCleared > 0) {
-        playSound('clear');
-        setLines((prev) => {
-          const nextLines = prev + linesCleared;
-          const targetLevel = Math.floor(nextLines / 10) + 1;
-          if (targetLevel > level) {
-            setLevel(targetLevel);
-            playSound('level');
-          }
-          return nextLines;
-        });
-      }
+    const updatedScore = scoreRef.current + gain;
+    if (gain > 0) {
+      scoreRef.current = updatedScore;
+      setScore(updatedScore);
+    }
 
-      if (messageText !== '') {
-        let subText = `+${gain} PTS`;
-        if (nextCombo > 1) {
-          subText = `${nextCombo - 1} COMBO! ` + subText;
+    if (linesCleared > 0) {
+      playSound('clear');
+      setLines((prev) => {
+        const nextLines = prev + linesCleared;
+        const targetLevel = Math.floor(nextLines / 10) + 1;
+        if (targetLevel > level) {
+          setLevel(targetLevel);
+          playSound('level');
         }
-        setActiveMessage({
-          id: Date.now(),
-          text: messageText,
-          subtext: subText,
-          color: messageColor,
-        });
-      } else if (linesCleared > 0 && nextCombo > 1) {
-        setActiveMessage({
-          id: Date.now(),
-          text: `${nextCombo - 1} COMBO!`,
-          subtext: `+${gain} PTS`,
-          color: 'text-zinc-200 bg-zinc-900/80 border border-zinc-700/50 shadow-md shadow-black/40',
-        });
-      }
+        return nextLines;
+      });
+    }
 
-      // Garbage transmission rules based on standard competitive Tetris:
-      let garbageToSend = 0;
-      if (isTSpin) {
-        if (isMini) {
-          if (linesCleared === 1) garbageToSend = 1;
-          else if (linesCleared === 2) garbageToSend = 2;
-        } else {
-          if (linesCleared === 1) garbageToSend = 2;
-          else if (linesCleared === 2) garbageToSend = 4;
-          else if (linesCleared >= 3) garbageToSend = 6;
-        }
+    if (messageText !== '') {
+      let subText = `+${gain} PTS`;
+      if (nextCombo > 1) {
+        subText = `${nextCombo - 1} COMBO! ` + subText;
+      }
+      setActiveMessage({
+        id: Date.now(),
+        text: messageText,
+        subtext: subText,
+        color: messageColor,
+      });
+    } else if (linesCleared > 0 && nextCombo > 1) {
+      setActiveMessage({
+        id: Date.now(),
+        text: `${nextCombo - 1} COMBO!`,
+        subtext: `+${gain} PTS`,
+        color: 'text-zinc-200 bg-zinc-900/80 border border-zinc-700/50 shadow-md shadow-black/40',
+      });
+    }
+
+    let garbageToSend = 0;
+    if (isTSpin) {
+      if (isMini) {
+        if (linesCleared === 1) garbageToSend = 1;
+        else if (linesCleared === 2) garbageToSend = 2;
       } else {
-        if (linesCleared === 2) garbageToSend = 1;
-        else if (linesCleared === 3) garbageToSend = 2;
-        else if (linesCleared === 4) garbageToSend = 4;
+        if (linesCleared === 1) garbageToSend = 2;
+        else if (linesCleared === 2) garbageToSend = 4;
+        else if (linesCleared >= 3) garbageToSend = 6;
       }
+    } else {
+      if (linesCleared === 2) garbageToSend = 1;
+      else if (linesCleared === 3) garbageToSend = 2;
+      else if (linesCleared === 4) garbageToSend = 4;
+    }
 
-      // Add combo-based attack power (combos consecutively increase lines sent!)
-      let comboGarbage = 0;
-      if (linesCleared > 0 && nextCombo > 1) {
-        comboGarbage = Math.min(5, Math.floor(nextCombo / 2));
-      }
+    let comboGarbage = 0;
+    if (linesCleared > 0 && nextCombo > 1) {
+      comboGarbage = Math.min(5, Math.floor(nextCombo / 2));
+    }
 
-      const totalGarbage = garbageToSend + comboGarbage;
+    const totalGarbage = garbageToSend + comboGarbage;
 
-      if (totalGarbage > 0) {
-        if (gameMode === 'ai') {
-          triggerAIGarbage(totalGarbage);
-        } else if (gameMode === 'online' && channelRef.current) {
-          channelRef.current.send({
-            type: 'broadcast',
-            event: 'tetris_send_garbage',
-            payload: { lines: totalGarbage }
-          });
-        }
-      }
-
-      // Sync updated state to online opponent
-      if (gameMode === 'online' && channelRef.current) {
+    if (totalGarbage > 0) {
+      if (gameMode === 'ai') {
+        triggerAIGarbage(totalGarbage);
+      } else if (gameMode === 'online' && channelRef.current) {
         channelRef.current.send({
           type: 'broadcast',
-          event: 'tetris_sync_grid',
-          payload: {
-            playerId: myPlayerId.current,
-            username: myUsername,
-            grid: filteredGrid,
-            score: score + gain,
-            isGameOver: isGameOverRef.current
-          }
+          event: 'tetris_send_garbage',
+          payload: { lines: totalGarbage }
         });
       }
+    }
 
-      return filteredGrid;
-    });
+    // Sync updated state to online opponent
+    if (gameMode === 'online' && channelRef.current) {
+      channelRef.current.send({
+        type: 'broadcast',
+        event: 'tetris_sync_grid',
+        payload: {
+          playerId: myPlayerId.current,
+          username: myUsername,
+          grid: filteredGrid,
+          score: updatedScore,
+          isGameOver: isGameOverRef.current
+        }
+      });
+    }
 
     // Handle any incoming garbage lines and spawn next piece
     setTimeout(() => {
       injectGarbageLines();
       spawnPiece(nextPiecesRef.current);
     }, 0);
-  }, [level, playSound, spawnPiece, gameMode, roomId, injectGarbageLines, score]);
+  }, [level, playSound, spawnPiece, gameMode, injectGarbageLines, myUsername]);
 
   // Update lock delay timeout and evaluation
   const updateLockDelay = useCallback((piece: ActivePiece) => {
@@ -915,8 +892,8 @@ export function TetrisApp() {
           ArrowRight: () => handleMoveX(1),
           ArrowUp: () => handleRotate('cw'),
           ArrowDown: () => handleSoftDrop(),
-          c: () => handleHold(),
-          C: () => handleHold(),
+          v: () => handleHold(),
+          V: () => handleHold(),
           z: () => handleRotate('ccw'),
           Z: () => handleRotate('ccw'),
         };
@@ -926,7 +903,7 @@ export function TetrisApp() {
           ArrowRight: () => handleMoveX(1),
           ArrowUp: () => handleRotate('cw'),
           ArrowDown: () => handleSoftDrop(),
-          KeyC: () => handleHold(),
+          KeyV: () => handleHold(),
           KeyZ: () => handleRotate('ccw'),
         };
 
@@ -1218,7 +1195,7 @@ export function TetrisApp() {
 
 
   // ==========================================
-  // REAL-TIME SUPABASE MULTIPLAYER ROOMS
+  // REAL-TIME WEBSOCKET MULTIPLAYER ROOMS
   // ==========================================
 
   // --- Create/Join Online Room Helper ---
@@ -1232,16 +1209,10 @@ export function TetrisApp() {
     setOnlineErrorText('');
     setOnlineStatusText('接続中...');
 
-    const client = getSupabaseClient();
-    if (!client) {
-      setOnlineErrorText('Supabaseへの接続に失敗しました。');
-      return;
-    }
-
     // Clean up any existing channel
-    if (channelRef.current && supabaseRef.current) {
+    if (channelRef.current) {
       try {
-        supabaseRef.current.removeChannel(channelRef.current);
+        channelRef.current.unsubscribe();
       } catch (e) {}
       channelRef.current = null;
     }
@@ -1250,19 +1221,20 @@ export function TetrisApp() {
       setOnlineIsCreator(isCreator);
       setOpponents({}); // Clear previous opponents
 
-      const channel = client.channel(`tetris-room-${cleanCode}`, {
-        config: { broadcast: { self: false } },
+      const sessionUser = localStorage.getItem('wetalks_logged_in_user') || myUsername;
+      const channel = createWsRoomChannel(`tetris-room-${cleanCode}`, {
+        memberId: myPlayerId.current,
+        username: sessionUser,
       });
 
       channelRef.current = channel;
 
-      const sessionUser = localStorage.getItem('wetalks_logged_in_user') || 'Player_' + Math.random().toString(36).substr(2, 4);
-
       channel
-        .on('broadcast', { event: 'tetris_join' }, (payload: any) => {
+        .on('tetris_join', (payload: any) => {
           playSound('level');
-          const newPlayerId = payload.payload.playerId;
-          const newPlayerName = payload.payload.username;
+          const newPlayerId = payload.playerId;
+          const newPlayerName = payload.username || 'Opponent';
+          if (!newPlayerId || newPlayerId === myPlayerId.current) return;
 
           setOpponents(prev => {
             if (Object.keys(prev).length >= 4 && !prev[newPlayerId]) {
@@ -1272,9 +1244,9 @@ export function TetrisApp() {
             next[newPlayerId] = {
               id: newPlayerId,
               name: newPlayerName,
-              grid: Array.from({ length: 20 }, () => Array(10).fill(0)),
-              score: 0,
-              isGameOver: false,
+              grid: prev[newPlayerId]?.grid || Array.from({ length: 20 }, () => Array(10).fill(0)),
+              score: prev[newPlayerId]?.score || 0,
+              isGameOver: prev[newPlayerId]?.isGameOver || false,
               lastActive: Date.now()
             };
             return next;
@@ -1287,12 +1259,16 @@ export function TetrisApp() {
             payload: {
               playerId: myPlayerId.current,
               username: sessionUser,
+              grid: gridRef.current,
+              score: scoreRef.current,
+              isGameOver: isGameOverRef.current,
             },
           });
         })
-        .on('broadcast', { event: 'tetris_presence_reply' }, (payload: any) => {
-          const remotePlayerId = payload.payload.playerId;
-          const remotePlayerName = payload.payload.username;
+        .on('tetris_presence_reply', (payload: any) => {
+          const remotePlayerId = payload.playerId;
+          const remotePlayerName = payload.username || 'Opponent';
+          if (!remotePlayerId || remotePlayerId === myPlayerId.current) return;
 
           setOpponents(prev => {
             if (Object.keys(prev).length >= 4 && !prev[remotePlayerId]) {
@@ -1302,55 +1278,57 @@ export function TetrisApp() {
             next[remotePlayerId] = {
               id: remotePlayerId,
               name: remotePlayerName,
-              grid: payload.payload.grid || prev[remotePlayerId]?.grid || Array.from({ length: 20 }, () => Array(10).fill(0)),
-              score: payload.payload.score || prev[remotePlayerId]?.score || 0,
-              isGameOver: payload.payload.isGameOver || prev[remotePlayerId]?.isGameOver || false,
+              grid: payload.grid || prev[remotePlayerId]?.grid || Array.from({ length: 20 }, () => Array(10).fill(0)),
+              score: payload.score ?? prev[remotePlayerId]?.score ?? 0,
+              isGameOver: payload.isGameOver ?? prev[remotePlayerId]?.isGameOver ?? false,
               lastActive: Date.now()
             };
             return next;
           });
         })
-        .on('broadcast', { event: 'tetris_start_match' }, () => {
+        .on('tetris_start_match', () => {
           playSound('level');
           setMatchStatus('connected');
           setOnlineSetupState('playing');
           setIsPlaying(true);
           resetPlayerGame();
         })
-        .on('broadcast', { event: 'tetris_sync_grid' }, (payload: any) => {
-          const remoteId = payload.payload.playerId;
+        .on('tetris_sync_grid', (payload: any) => {
+          const remoteId = payload.playerId;
+          if (!remoteId || remoteId === myPlayerId.current) return;
           setOpponents(prev => {
             const next = { ...prev };
             if (next[remoteId]) {
               next[remoteId] = {
                 ...next[remoteId],
-                grid: payload.payload.grid,
-                score: payload.payload.score,
-                isGameOver: payload.payload.isGameOver ?? next[remoteId].isGameOver,
+                grid: payload.grid,
+                score: payload.score,
+                isGameOver: payload.isGameOver ?? next[remoteId].isGameOver,
                 lastActive: Date.now()
               };
             } else if (Object.keys(prev).length < 4) {
               next[remoteId] = {
                 id: remoteId,
-                name: payload.payload.username || 'Opponent',
-                grid: payload.payload.grid,
-                score: payload.payload.score,
-                isGameOver: payload.payload.isGameOver || false,
+                name: payload.username || 'Opponent',
+                grid: payload.grid,
+                score: payload.score,
+                isGameOver: payload.isGameOver || false,
                 lastActive: Date.now()
               };
             }
             return next;
           });
         })
-        .on('broadcast', { event: 'tetris_send_garbage' }, (payload: any) => {
+        .on('tetris_send_garbage', (payload: any) => {
           // Add garbage to our grid if we are playing and not gameover
-          if (!isGameOverRef.current) {
-            garbageQueueRef.current += payload.payload.lines;
+          if (!isGameOverRef.current && payload.lines > 0) {
+            garbageQueueRef.current += payload.lines;
             playSound('garbage');
           }
         })
-        .on('broadcast', { event: 'tetris_gameover' }, (payload: any) => {
-          const remoteId = payload.payload.playerId;
+        .on('tetris_gameover', (payload: any) => {
+          const remoteId = payload.playerId;
+          if (!remoteId) return;
           setOpponents(prev => {
             const next = { ...prev };
             if (next[remoteId]) {
@@ -1362,8 +1340,18 @@ export function TetrisApp() {
             return next;
           });
         })
-        .on('broadcast', { event: 'tetris_leave' }, (payload: any) => {
-          const remoteId = payload.payload.playerId;
+        .on('tetris_leave', (payload: any) => {
+          const remoteId = payload.playerId;
+          if (!remoteId) return;
+          setOpponents(prev => {
+            const next = { ...prev };
+            delete next[remoteId];
+            return next;
+          });
+        })
+        .on('relay_member_left', (payload: any) => {
+          const remoteId = payload.memberId;
+          if (!remoteId) return;
           setOpponents(prev => {
             const next = { ...prev };
             delete next[remoteId];
@@ -1373,7 +1361,6 @@ export function TetrisApp() {
 
       channel.subscribe((status: string) => {
         if (status === 'SUBSCRIBED') {
-          // Broadcast our join event
           channel.send({
             type: 'broadcast',
             event: 'tetris_join',
@@ -1384,8 +1371,8 @@ export function TetrisApp() {
           });
           setOnlineSetupState('room');
           setOnlineStatusText(`部屋 [${cleanCode.toUpperCase()}] に接続しました。メンバーを待っています...`);
-        } else {
-          setOnlineErrorText('接続に失敗しました。');
+        } else if (status === 'ERROR') {
+          setOnlineErrorText('リアルタイムサーバーへの接続に失敗しました。');
         }
       });
     } catch (e: any) {
@@ -1421,14 +1408,14 @@ export function TetrisApp() {
   // --- Leave Online Room ---
   const handleLeaveOnlineRoom = () => {
     playSound('move');
-    if (channelRef.current && supabaseRef.current) {
+    if (channelRef.current) {
       try {
         channelRef.current.send({
           type: 'broadcast',
           event: 'tetris_leave',
           payload: { playerId: myPlayerId.current },
         });
-        supabaseRef.current.removeChannel(channelRef.current);
+        channelRef.current.unsubscribe();
       } catch (e) {}
     }
     channelRef.current = null;
@@ -1447,6 +1434,7 @@ export function TetrisApp() {
     gridRef.current = cleanGrid; // Synchronously update ref to prevent stale collision on restart!
 
     setScore(0);
+    scoreRef.current = 0;
     setLines(0);
     setLevel(1);
     setHoldPiece(null);
@@ -1489,8 +1477,11 @@ export function TetrisApp() {
             type: 'broadcast',
             event: 'tetris_sync_grid',
             payload: {
+              playerId: myPlayerId.current,
+              username: myUsername,
               grid: Array.from({ length: 20 }, () => Array(10).fill(0)),
-              score: 0
+              score: 0,
+              isGameOver: false,
             }
           });
         }
@@ -1787,7 +1778,7 @@ export function TetrisApp() {
                     <span className="text-zinc-400">一瞬で落とす (ハードドロップ)</span>
                   </div>
                   <div className="flex items-center gap-2 col-span-2 border-t border-zinc-800/50 pt-2">
-                    <span className="bg-zinc-800 text-cyan-400 px-2 py-1 rounded border border-cyan-500/20 font-mono text-[10px]">C</span>
+                    <span className="bg-zinc-800 text-cyan-400 px-2 py-1 rounded border border-cyan-500/20 font-mono text-[10px]">V</span>
                     <span className="text-zinc-400">ホールド / 取り出し (Hold)</span>
                   </div>
                 </div>
@@ -1824,7 +1815,7 @@ export function TetrisApp() {
                     <span className="text-[9px] text-zinc-600 uppercase font-mono tracking-wider">EMPTY</span>
                   )}
                 </div>
-                <span className="text-[8px] text-zinc-600 mt-1 font-mono">KEY [C]</span>
+                <span className="text-[8px] text-zinc-600 mt-1 font-mono">KEY [V]</span>
               </div>
 
               {/* STATS PANEL */}

@@ -313,6 +313,38 @@ export const BrowserApp: React.FC<BrowserAppProps> = ({ onOpenNotepadWithFile })
     }
   };
 
+  const openTabRef = useRef(openTab);
+  openTabRef.current = openTab;
+
+  useEffect(() => {
+    const consumePendingUrl = (targetUrl?: string) => {
+      const raw = targetUrl || (() => {
+        try {
+          const v = localStorage.getItem('webos_browser_pending_url');
+          if (v) localStorage.removeItem('webos_browser_pending_url');
+          return v || '';
+        } catch {
+          return '';
+        }
+      })();
+      if (raw) {
+        openTabRef.current(raw);
+      }
+    };
+    consumePendingUrl();
+    const handler = (e: Event) => {
+      const ce = e as CustomEvent<{ url?: string }>;
+      if (ce.detail?.url) {
+        try { localStorage.removeItem('webos_browser_pending_url'); } catch {}
+        consumePendingUrl(ce.detail.url);
+      } else {
+        consumePendingUrl();
+      }
+    };
+    window.addEventListener('webos_browser_open_url', handler);
+    return () => window.removeEventListener('webos_browser_open_url', handler);
+  }, []);
+
   const closeTab = (tabId: number) => {
     if (tabs.length === 1) {
       setTabs([{ id: 1, title: '新しいタブ', favicon: '🌐', url: null, history: [null], histIdx: 0 }]);
@@ -759,6 +791,7 @@ export const BrowserApp: React.FC<BrowserAppProps> = ({ onOpenNotepadWithFile })
                           !isWeTalks && !isYacht && !isUno ? tab.url || undefined : undefined
                         }
                         sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+                        allow="camera; microphone; autoplay; display-capture"
                         onLoad={(e) => handleFrameLoaded(tab.id, e.currentTarget)}
                         onError={() => handleFrameError(tab.id)}
                       />
@@ -775,6 +808,7 @@ export const BrowserApp: React.FC<BrowserAppProps> = ({ onOpenNotepadWithFile })
                 title="Split WeTalks"
                 srcDoc={CHAT_APP_HTML} 
                 sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+                allow="camera; microphone; autoplay; display-capture"
                 style={{ width: '100%', height: '100%', border: 'none' }}
               />
             </div>

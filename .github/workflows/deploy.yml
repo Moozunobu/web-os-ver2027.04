@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main # mainブランチにプッシュされたら起動
+  workflow_dispatch: # GitHub Actions画面から手動実行も可能にする
 
 permissions:
   contents: write
@@ -19,11 +20,18 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'npm'
 
       - name: Install and Build 🔧
+        env:
+          # NOTE: Only public client backend URLs belong here (never set TURSO_AUTH_TOKEN or secrets as VITE_*).
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+          VITE_WS_BASE_URL: ${{ vars.VITE_WS_BASE_URL }}
         run: |
           npm ci
+          npm run lint
           npm run build
+          cp dist/index.html dist/404.html
 
       - name: Deploy 🚀
         uses: JamesIves/github-pages-deploy-action@v4

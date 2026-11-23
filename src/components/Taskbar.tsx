@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { AppIcon } from './AppIcon';
+import { resolveCustomAppIconId } from './CustomAppIcons';
 import { AppID, WindowInstance } from '../types';
 import { Wifi, Volume2, Search, Battery, Command, Layers } from 'lucide-react';
 
@@ -219,7 +220,10 @@ export const Taskbar: React.FC<TaskbarProps> = ({
     noobstore: { icon: 'noobstore', name: 'Abord Store' },
     tetris: { icon: 'tetris', name: isJa ? 'テトリス' : 'Tetris' },
     sprout: { icon: 'sprout', name: 'Sprout Studio' },
+    vscode: { icon: 'vscode', name: 'VS Code' },
     aboad: { icon: 'aboad', name: 'Aboad' },
+    racing: { icon: 'racing', name: isJa ? 'レーシングカーゲーム' : 'Racing Car Game' },
+    floppybird: { icon: 'floppybird', name: 'Floppy Bird' },
   };
 
   const isLeftAlign = taskbarAlignment === 'left' || osTheme === 'winxp' || osTheme === 'winvista' || osTheme === 'win7';
@@ -397,8 +401,24 @@ export const Taskbar: React.FC<TaskbarProps> = ({
             const isPinned = pinnedAppIds.includes(appId);
             const isFullyMounted = isPinned || mountedAppIds.includes(appId);
 
-            const meta = appMeta[appId] || { icon: appId, name: appId };
             const win = openWindows.find((w) => w.id === appId);
+            let fallbackMeta = { icon: win?.icon || appId, name: win?.title || appId };
+            if (!appMeta[appId] && !win && appId.startsWith('custom-app-')) {
+              try {
+                const stored = localStorage.getItem('noobstore_installed_apps');
+                if (stored) {
+                  const installed = JSON.parse(stored);
+                  const found = installed.find((a: any) => a.id === appId);
+                  if (found) {
+                    fallbackMeta = {
+                      icon: resolveCustomAppIconId(found),
+                      name: found.title || appId,
+                    };
+                  }
+                }
+              } catch (e) {}
+            }
+            const meta = appMeta[appId] || fallbackMeta;
             const isOpen = win?.isOpen;
             const isActive = activeWindowId === appId && !win?.isMinimized;
 

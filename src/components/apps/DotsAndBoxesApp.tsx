@@ -1,10 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { createClient } from '@supabase/supabase-js';
+import { createWsRoomChannel, WsRoomChannel } from '../../utils/wsRelay';
 import { Play, Users, Bot, Layers, ArrowLeft, RefreshCw, Trophy, Volume2, VolumeX, Sparkles, AlertCircle } from 'lucide-react';
-
-// --- Supabase Credentials ---
-const SUPABASE_URL = 'https://nsyvlftqcciyetsbhymg.supabase.co';
-const SUPABASE_ANON_KEY = 'sb_publishable_lkhrFuMlNyEmUX4RTFApKw_AhD1sAkV';
 
 export const DotsAndBoxesApp: React.FC = () => {
   // --- Audio Synth Engine ---
@@ -103,8 +99,10 @@ export const DotsAndBoxesApp: React.FC = () => {
   const [opponentName, setOpponentName] = useState<string>('Opponent');
   const [statusText, setStatusText] = useState<string>('');
   const [errorText, setErrorText] = useState<string>('');
-  const supabaseRef = useRef<any>(null);
-  const channelRef = useRef<any>(null);
+  const myMemberIdRef = useRef<string>('db_' + Math.random().toString(36).slice(2, 8));
+  const gameStateRef = useRef(gameState);
+  useEffect(() => { gameStateRef.current = gameState; }, [gameState]);
+  const channelRef = useRef<WsRoomChannel | null>(null);
 
   // --- Active Game Board State ---
   const [drawnLines, setDrawnLines] = useState<Record<string, 'p1' | 'p2'>>({});
@@ -113,24 +111,15 @@ export const DotsAndBoxesApp: React.FC = () => {
   const [scores, setScores] = useState<{ p1: number; p2: number }>({ p1: 0, p2: 0 });
   const [hoveredLine, setHoveredLine] = useState<string | null>(null);
 
-  // --- Initialize Supabase ---
-  const getSupabaseClient = () => {
-    if (supabaseRef.current) return supabaseRef.current;
-    try {
-      const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-      supabaseRef.current = client;
-      return client;
-    } catch (err) {
-      console.error('Supabase init failed:', err);
-      return null;
-    }
-  };
-
   // Cleanup channel on unmount
   useEffect(() => {
     return () => {
-      if (channelRef.current && supabaseRef.current) {
-        supabaseRef.current.removeChannel(channelRef.current);
+      if (channelRef.current) {
+        try {
+          channelRef.current.send({ type: 'broadcast', event: 'db_leave', payload: {} });
+          channelRef.current.unsubscribe();
+        } catch (e) {}
+        channelRef.current = null;
       }
     };
   }, []);
@@ -449,7 +438,7 @@ export const DotsAndBoxesApp: React.FC = () => {
     }
   };
 
-  // --- Online Supabase Room System Actions ---
+  // --- Online WebSocket Room System Actions ---
   const handleCreateRoom = async () => {
     playSound('click');
     const normalizedRoom = roomCode.trim().toLowerCase();
@@ -460,55 +449,58 @@ export const DotsAndBoxesApp: React.FC = () => {
     setErrorText('');
     setStatusText('Creating room...');
 
-    const client = getSupabaseClient();
-    if (!client) {
-      setErrorText('Could not connect to Supabase. Check settings.');
-      return;
-    }
-
-    // Clean up any existing channel before creating/joining
-    if (channelRef.current && supabaseRef.current) {
+    if (channelRef.current) {
       try {
-        supabaseRef.current.removeChannel(channelRef.current);
+        channelRef.current.unsubscribe();
       } catch (e) {}
       channelRef.current = null;
     }
 
     try {
+      const myName = localStorage.getItem('wetalks_logged_in_user') || 'Player 1';
       setIsCreator(true);
       setPlayerId('p1');
       setOpponentName('Waiting...');
 
-      const channel = client.channel(`dots-room-${normalizedRoom}`, {
-        config: { broadcast: { self: false } },
+      const channel = createWsRoomChannel(`dots-room-${normalizedRoom}`, {
+        memberId: myMemberIdRef.current,
+        username: myName,
       });
 
       channelRef.current = channel;
 
       channel
-        .on('broadcast', { event: 'db_join' }, (payload: any) => {
+        .on('db_join', (payload: any) => {
           playSound('join');
-          setOpponentName(payload.payload.username || 'Guest Player');
+          setOpponentName(payload.username || 'Player 2');
           setStatusText('Player joined! Initializing game...');
-          
+
           channel.send({
             type: 'broadcast',
             event: 'db_init_board',
             payload: {
               gridSize,
-              opponentName: 'Player 1',
+              opponentName: myName,
             },
           });
 
-          // Begin playing
           setDrawnLines({});
           setBoxes({});
           setScores({ p1: 0, p2: 0 });
           setCurrentTurn('p1');
           setGameState('playing');
         })
-        .on('broadcast', { event: 'db_line_drawn' }, (payload: any) => {
-          const { drawnLines: nextDrawn, boxes: nextBoxes, scores: nextScores, currentTurn: nextTurn, gameState: nextGameState } = payload.payload;
+        .on('relay_member_joined', () => {
+          if (gameStateRef.current === 'room') {
+            channel.send({
+              type: 'broadcast',
+              event: 'db_host_ready',
+              payload: { gridSize, opponentName: myName },
+            });
+          }
+        })
+        .on('db_line_drawn', (payload: any) => {
+          const { drawnLines: nextDrawn, boxes: nextBoxes, scores: nextScores, currentTurn: nextTurn, gameState: nextGameState } = payload;
           setDrawnLines(nextDrawn);
           setBoxes(nextBoxes);
           setScores(nextScores);
@@ -520,20 +512,27 @@ export const DotsAndBoxesApp: React.FC = () => {
             playSound('place');
           }
         })
-        .on('broadcast', { event: 'db_leave' }, () => {
+        .on('db_leave', () => {
           setOpponentName('Left');
           setStatusText('Opponent disconnected');
-          window.parent.postMessage({
-            type: 'WETALKS_NEW_MESSAGE',
-            payload: { sender: 'System', text: '対戦相手が退出しました。' }
-          }, '*');
+        })
+        .on('relay_member_left', () => {
+          if (gameStateRef.current === 'playing' || gameStateRef.current === 'gameover') {
+            setOpponentName('Left');
+            setStatusText('Opponent disconnected');
+          }
         });
 
       channel.subscribe((status: string) => {
         if (status === 'SUBSCRIBED') {
           setGameState('room');
-          setStatusText(`Room code [${normalizedRoom}] created. Share this with your opponent!`);
-        } else {
+          setStatusText(`Room code [${normalizedRoom.toUpperCase()}] created. Share this with your opponent!`);
+          channel.send({
+            type: 'broadcast',
+            event: 'db_host_ready',
+            payload: { gridSize, opponentName: myName },
+          });
+        } else if (status === 'ERROR') {
           setErrorText('Subscription failed. Retry.');
         }
       });
@@ -552,44 +551,51 @@ export const DotsAndBoxesApp: React.FC = () => {
     setErrorText('');
     setStatusText('Joining room...');
 
-    const client = getSupabaseClient();
-    if (!client) {
-      setErrorText('Could not connect to Supabase. Check settings.');
-      return;
-    }
-
-    // Clean up any existing channel before creating/joining
-    if (channelRef.current && supabaseRef.current) {
+    if (channelRef.current) {
       try {
-        supabaseRef.current.removeChannel(channelRef.current);
+        channelRef.current.unsubscribe();
       } catch (e) {}
       channelRef.current = null;
     }
 
     try {
+      const myName = localStorage.getItem('wetalks_logged_in_user') || 'Player 2';
       setIsCreator(false);
       setPlayerId('p2');
       setOpponentName('Player 1');
 
-      const channel = client.channel(`dots-room-${normalizedRoom}`, {
-        config: { broadcast: { self: false } },
+      const channel = createWsRoomChannel(`dots-room-${normalizedRoom}`, {
+        memberId: myMemberIdRef.current,
+        username: myName,
       });
 
       channelRef.current = channel;
+      let boardInitialized = false;
 
       channel
-        .on('broadcast', { event: 'db_init_board' }, (payload: any) => {
+        .on('db_host_ready', () => {
+          if (!boardInitialized) {
+            channel.send({
+              type: 'broadcast',
+              event: 'db_join',
+              payload: { username: myName },
+            });
+          }
+        })
+        .on('db_init_board', (payload: any) => {
+          boardInitialized = true;
           playSound('join');
-          setGridSize(payload.payload.gridSize);
-          setOpponentName(payload.payload.opponentName || 'Player 1');
+          setGridSize(payload.gridSize);
+          setOpponentName(payload.opponentName || 'Player 1');
           setDrawnLines({});
           setBoxes({});
           setScores({ p1: 0, p2: 0 });
           setCurrentTurn('p1');
+          setStatusText('');
           setGameState('playing');
         })
-        .on('broadcast', { event: 'db_line_drawn' }, (payload: any) => {
-          const { drawnLines: nextDrawn, boxes: nextBoxes, scores: nextScores, currentTurn: nextTurn, gameState: nextGameState } = payload.payload;
+        .on('db_line_drawn', (payload: any) => {
+          const { drawnLines: nextDrawn, boxes: nextBoxes, scores: nextScores, currentTurn: nextTurn, gameState: nextGameState } = payload;
           setDrawnLines(nextDrawn);
           setBoxes(nextBoxes);
           setScores(nextScores);
@@ -601,12 +607,15 @@ export const DotsAndBoxesApp: React.FC = () => {
             playSound('place');
           }
         })
-        .on('broadcast', { event: 'db_leave' }, () => {
+        .on('db_leave', () => {
+          setOpponentName('Left');
           setStatusText('Opponent disconnected');
-          window.parent.postMessage({
-            type: 'WETALKS_NEW_MESSAGE',
-            payload: { sender: 'System', text: '対戦相手が退出しました。' }
-          }, '*');
+        })
+        .on('relay_member_left', () => {
+          if (gameStateRef.current === 'playing' || gameStateRef.current === 'gameover') {
+            setOpponentName('Left');
+            setStatusText('Opponent disconnected');
+          }
         });
 
       channel.subscribe((status: string) => {
@@ -615,11 +624,11 @@ export const DotsAndBoxesApp: React.FC = () => {
             type: 'broadcast',
             event: 'db_join',
             payload: {
-              username: 'Player 2',
+              username: myName,
             },
           });
-          setStatusText('Connected! Synchronizing board state...');
-        } else {
+          setStatusText('Connected! Awaiting host initialization...');
+        } else if (status === 'ERROR') {
           setErrorText('Could not connect to the real-time room.');
         }
       });
@@ -630,17 +639,19 @@ export const DotsAndBoxesApp: React.FC = () => {
 
   const handleLeaveRoom = () => {
     playSound('click');
-    if (channelRef.current && supabaseRef.current) {
+    if (channelRef.current) {
       try {
         channelRef.current.send({
           type: 'broadcast',
           event: 'db_leave',
           payload: {},
         });
-        supabaseRef.current.removeChannel(channelRef.current);
+        channelRef.current.unsubscribe();
       } catch (e) {}
     }
     channelRef.current = null;
+    setStatusText('');
+    setErrorText('');
     setGameState('menu');
     setGameMode(null);
     setDrawnLines({});
@@ -843,6 +854,12 @@ export const DotsAndBoxesApp: React.FC = () => {
                   <div className="flex items-center gap-2 p-3 bg-red-950/30 border border-red-900/30 text-red-400 text-[11px] rounded-lg">
                     <AlertCircle className="w-4 h-4 flex-shrink-0" />
                     <span>{errorText}</span>
+                  </div>
+                )}
+
+                {statusText && (
+                  <div className="p-3 bg-cyan-950/30 border border-cyan-500/30 text-cyan-300 text-[11px] rounded-lg text-center font-medium">
+                    {statusText}
                   </div>
                 )}
 

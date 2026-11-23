@@ -1318,7 +1318,7 @@ export default function FlightSimulatorApp({ onClose }: FlightSimulatorAppProps)
 
   const handleUnlockSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (passwordInput === 'mozunbu_1203') {
+    if (passwordInput === 'mozunbu1203') {
       setIsUnlocked(true);
       setPasswordError(false);
     } else {

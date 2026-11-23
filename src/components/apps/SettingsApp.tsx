@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { WALLPAPERS, SettingsState } from '../../types';
 import {
   Palette,
@@ -18,6 +18,12 @@ import {
   Monitor,
   CheckCircle2,
   Sparkles,
+  Upload,
+  Image as ImageIcon,
+  Activity,
+  Maximize2,
+  Link,
+  Eye,
 } from 'lucide-react';
 
 interface SettingsAppProps {
@@ -46,6 +52,8 @@ export const SettingsApp: React.FC<SettingsAppProps> = ({
   const [confirmPasswordInput, setConfirmPasswordInput] = useState(settings.password || '');
   const [showPassword, setShowPassword] = useState(false);
   const [savedSuccessMsg, setSavedSuccessMsg] = useState('');
+  const [customImageUrl, setCustomImageUrl] = useState('');
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const isJa = settings.language === 'ja';
 
@@ -54,6 +62,37 @@ export const SettingsApp: React.FC<SettingsAppProps> = ({
       ...settings,
       ...partial,
     });
+  };
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Check if file is image
+    if (!file.type.startsWith('image/')) {
+      alert(isJa ? '画像ファイル (PNG, JPG, GIF, WebP, SVG) を選択してください。' : 'Please select a valid image file.');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const dataUrl = event.target?.result as string;
+      if (dataUrl) {
+        handleUpdate({ fullscreenImage: dataUrl });
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleApplyCustomUrl = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!customImageUrl.trim()) return;
+    handleUpdate({ fullscreenImage: customImageUrl.trim() });
+    setCustomImageUrl('');
+  };
+
+  const handleTriggerTestOverlay = () => {
+    window.dispatchEvent(new CustomEvent('webos_toggle_fullscreen_panic'));
   };
 
   const handleSaveAccount = (e: React.FormEvent) => {
@@ -454,6 +493,209 @@ export const SettingsApp: React.FC<SettingsAppProps> = ({
                       </div>
                     );
                   })}
+                </div>
+              </div>
+
+              {/* ─── FULLSCREEN DISPLAY IMAGE SETTING (全画面表示画像を選択 / Cキー パニックスクリーン) ─── */}
+              <div
+                className={`p-4 rounded-xl border space-y-4 ${
+                  settings.isDarkTheme ? 'bg-zinc-800/50 border-zinc-700' : 'bg-white border-slate-200'
+                }`}
+                id="settings-fullscreen-image-section"
+              >
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div>
+                    <p className="font-bold text-xs flex items-center gap-1.5 text-blue-500">
+                      <Maximize2 className="w-4 h-4" />
+                      <span>{isJa ? '全画面表示画像を選択 (Cキー パニック/偽装画面)' : 'Select Fullscreen Display Image (C Key Panic Screen)'}</span>
+                    </p>
+                    <p className="text-[11px] opacity-70 mt-1 leading-relaxed">
+                      {isJa
+                        ? 'Cキーを押すと、保存した画像が全画面表示されます。画像が設定されていない場合は、多機能な関数グラフ電卓（数式入力＆リアルタイムグラフ）が自動的に全画面表示されます。もう一度Cキーを押すと元の画面に戻ります。'
+                        : 'Pressing the C key will instantly display the saved image in fullscreen. If no image is set, an interactive function graphing calculator will be displayed. Press C again to return.'}
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      onClick={handleTriggerTestOverlay}
+                      className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition-all active:scale-95"
+                      title={isJa ? '今すぐ全画面表示をテスト (Cキー)' : 'Test Fullscreen Mode (C Key)'}
+                      id="settings-btn-test-fullscreen"
+                    >
+                      <Eye className="w-3.5 h-3.5" />
+                      <span>{isJa ? '全画面テスト (C)' : 'Test Fullscreen (C)'}</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Current Mode & Preview Card */}
+                <div
+                  className={`p-3.5 rounded-xl border flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 ${
+                    settings.isDarkTheme ? 'bg-zinc-900/90 border-zinc-750' : 'bg-slate-50 border-slate-200'
+                  }`}
+                >
+                  <div className="flex items-center gap-3.5">
+                    {/* Thumbnail box */}
+                    <div className="w-20 h-14 rounded-lg overflow-hidden border border-zinc-700/60 bg-zinc-950 flex items-center justify-center shrink-0 shadow-sm relative group">
+                      {settings.fullscreenImage ? (
+                        <img
+                          src={settings.fullscreenImage}
+                          alt="Fullscreen preview"
+                          className="w-full h-full object-cover"
+                          referrerPolicy="no-referrer"
+                        />
+                      ) : (
+                        <div className="flex flex-col items-center justify-center text-blue-400 gap-1">
+                          <Activity className="w-5 h-5 animate-pulse" />
+                          <span className="text-[9px] font-mono font-bold">グラフ電卓</span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-bold">
+                          {settings.fullscreenImage
+                            ? isJa
+                              ? 'カスタム画像が設定中'
+                              : 'Custom Image Active'
+                            : isJa
+                            ? '関数グラフ電卓モード (画像未設定)'
+                            : 'Interactive Graph Calculator Mode'}
+                        </span>
+                        <span
+                          className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                            settings.fullscreenImage
+                              ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                              : 'bg-blue-500/10 text-blue-400 border border-blue-500/20'
+                          }`}
+                        >
+                          {settings.fullscreenImage ? (isJa ? '画像モード' : 'Image Mode') : (isJa ? '電卓モード' : 'Calculator Mode')}
+                        </span>
+                      </div>
+                      <p className="text-[11px] opacity-60 mt-0.5">
+                        {settings.fullscreenImage
+                          ? isJa
+                            ? 'Cキーでこの画像が全画面いっぱいに表示されます。'
+                            : 'This image will be displayed in full screen when C is pressed.'
+                          : isJa
+                          ? '画像を設定しない場合、左側に計算式・右側にグラフの電卓が起動します。'
+                          : 'Without an image, a math equation and interactive graph app will launch.'}
+                      </p>
+                    </div>
+                  </div>
+
+                  {settings.fullscreenImage && (
+                    <button
+                      onClick={() => handleUpdate({ fullscreenImage: undefined })}
+                      className="px-3 py-1.5 text-xs text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg border border-red-500/30 flex items-center gap-1.5 font-semibold transition-colors shrink-0"
+                      title={isJa ? '画像を解除してグラフ電卓に戻す' : 'Clear image and switch to graph app'}
+                      id="settings-btn-clear-fullscreen-image"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>{isJa ? '画像を解除 (電卓に戻す)' : 'Clear Image'}</span>
+                    </button>
+                  )}
+                </div>
+
+                {/* Upload & Selection Options */}
+                <div className="space-y-3 pt-1">
+                  <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+                    {/* File Upload Button */}
+                    <input
+                      type="file"
+                      ref={fileInputRef}
+                      onChange={handleFileUpload}
+                      accept="image/*"
+                      className="hidden"
+                      id="settings-file-upload-fullscreen"
+                    />
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      className={`flex-1 py-2 px-3 rounded-lg border text-xs font-semibold flex items-center justify-center gap-2 transition-all active:scale-98 ${
+                        settings.isDarkTheme
+                          ? 'bg-zinc-800 hover:bg-zinc-700 border-zinc-700 text-zinc-200'
+                          : 'bg-slate-100 hover:bg-slate-200 border-slate-300 text-slate-700'
+                      }`}
+                      id="settings-btn-upload-image"
+                    >
+                      <Upload className="w-4 h-4 text-blue-400" />
+                      <span>{isJa ? 'ローカルから画像ファイルを選択...' : 'Upload Image File...'}</span>
+                    </button>
+
+                    {/* URL Input */}
+                    <form onSubmit={handleApplyCustomUrl} className="flex-1 flex items-center gap-1.5">
+                      <div className="flex-1 relative">
+                        <Link className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 opacity-40 pointer-events-none" />
+                        <input
+                          type="text"
+                          placeholder={isJa ? '画像URLを入力して適用...' : 'Enter direct image URL...'}
+                          value={customImageUrl}
+                          onChange={(e) => setCustomImageUrl(e.target.value)}
+                          className={`w-full pl-8 pr-2.5 py-1.5 text-xs rounded-lg border outline-none font-mono ${
+                            settings.isDarkTheme
+                              ? 'bg-zinc-900 border-zinc-700 focus:border-blue-500 text-zinc-100 placeholder-zinc-600'
+                              : 'bg-slate-50 border-slate-300 focus:border-blue-500 text-slate-800 placeholder-slate-400'
+                          }`}
+                        />
+                      </div>
+                      <button
+                        type="submit"
+                        disabled={!customImageUrl.trim()}
+                        className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-xs font-bold transition-all"
+                      >
+                        {isJa ? '適用' : 'Apply'}
+                      </button>
+                    </form>
+                  </div>
+
+                  {/* Preset Sample Images for Panic / Disguise */}
+                  <div className="space-y-1.5">
+                    <p className="text-[11px] font-semibold text-zinc-400">
+                      {isJa ? 'おすすめプリセット画像 (ワンクリックで設定)' : 'Recommended Preset Disguise Images'}
+                    </p>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {[
+                        {
+                          name: isJa ? 'VS Code (プログラム)' : 'VS Code Editor',
+                          url: 'https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=1600&q=80',
+                          desc: 'コード画面',
+                        },
+                        {
+                          name: isJa ? '講義・数学ノート' : 'Math Study Notes',
+                          url: 'https://images.unsplash.com/photo-1509228468518-180dd4864904?w=1600&q=80',
+                          desc: '学習ノート風',
+                        },
+                        {
+                          name: isJa ? 'ビジネスチャート' : 'Business Analytics',
+                          url: 'https://images.unsplash.com/photo-1460925895917-afdab827c52f?w=1600&q=80',
+                          desc: '分析グラフ',
+                        },
+                        {
+                          name: isJa ? '作業ラップトップ' : 'Workspace View',
+                          url: 'https://images.unsplash.com/photo-1517694712202-14dd9538aa97?w=1600&q=80',
+                          desc: '執筆・作業風',
+                        },
+                      ].map((preset, idx) => (
+                        <button
+                          key={idx}
+                          type="button"
+                          onClick={() => handleUpdate({ fullscreenImage: preset.url })}
+                          className={`p-2 rounded-lg border text-left transition-all text-xs flex flex-col gap-1 ${
+                            settings.fullscreenImage === preset.url
+                              ? 'ring-2 ring-blue-500 border-blue-500 bg-blue-500/10'
+                              : settings.isDarkTheme
+                              ? 'bg-zinc-900 border-zinc-800 hover:bg-zinc-800 hover:border-zinc-700'
+                              : 'bg-slate-50 border-slate-200 hover:bg-slate-100'
+                          }`}
+                        >
+                          <span className="font-bold text-[11px] truncate text-zinc-200">{preset.name}</span>
+                          <span className="text-[10px] text-zinc-500 truncate">{preset.desc}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>

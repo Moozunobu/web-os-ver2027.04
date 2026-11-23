@@ -2,11 +2,362 @@ import express from 'express';
 import http from 'http';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
+import {
+  GEOGUESSR_MAPS,
+  calculateGeoScore,
+  getDuelMultiplier,
+  haversineDistanceKm,
+  pickRandomMapLocations,
+  type GeoCoord,
+  type GeoMapId,
+  type GeoMoveMode,
+} from './src/data/geoguessrLocations';
+import {
+  TURSO_IMAGE_RETENTION_DAYS,
+  ensureTursoSchema,
+  hasTursoConfig,
+  isMemberOfTursoRoom,
+  tursoCreateRoom,
+  tursoDeleteMessage,
+  tursoDeleteRoom,
+  tursoDeleteUser,
+  tursoExportBundle,
+  tursoGetAdminBroadcasts,
+  tursoGetAdminOverview,
+  tursoGetAdminRoomMessages,
+  tursoGetMessagesForRoom,
+  tursoGetRoomById,
+  tursoGetRoomsForUser,
+  tursoGetUserByToken,
+  tursoImportBundle,
+  tursoInsertAdminBroadcast,
+  tursoInsertMessage,
+  tursoInviteToRoom,
+  tursoJoinCall,
+  tursoLeaveCall,
+  tursoListPublicUsers,
+  tursoLoginUser,
+  tursoMarkMessagesRead,
+  tursoPollCallSignals,
+  tursoProbeCallParticipants,
+  tursoPruneExpiredImages,
+  tursoRegisterUser,
+  tursoRelayJoin,
+  tursoRelayLeave,
+  tursoRelayPoll,
+  tursoRelaySend,
+  tursoRenameUser,
+  tursoSendCallSignal,
+  tursoSyncPresence,
+  tursoUpdateAvatar,
+  tursoUpdateCallMedia,
+} from './server/turso';
 
 dotenv.config();
+
+type GeoOnlineFormat = 'duels' | 'classic5';
+
+interface GeoPlayerState {
+  id: string;
+  name: string;
+  ws: WebSocket;
+  hp: number;
+  totalScore: number;
+  guess: GeoCoord | null;
+  softPin: GeoCoord | null;
+  guessedAt: number | null;
+  readyForNext: boolean;
+  wantsRematch: boolean;
+  connected: boolean;
+}
+
+interface GeoRoundHistoryEntry {
+  roundNumber: number;
+  actual: GeoCoord & { panoId?: string; locationLabel?: string };
+  multiplier: number;
+  results: Record<
+    string,
+    {
+      guess: GeoCoord | null;
+      distanceKm: number | null;
+      score: number;
+      damageDealt: number;
+      damageTaken: number;
+    }
+  >;
+}
+
+interface GeoRoomState {
+  roomCode: string;
+  hostId: string;
+  format: GeoOnlineFormat;
+  mapId: GeoMapId;
+  moveMode: GeoMoveMode;
+  roundTimeSec: number;
+  status: 'lobby' | 'playing' | 'round_result' | 'match_over';
+  currentRound: number;
+  maxRounds: number;
+  target: GeoCoord & { heading: number; panoId?: string; sdUrl?: string; az?: number; locationLabel?: string };
+  roundStartedAt: number | null;
+  roundDeadlineAt: number | null;
+  countdownEndAt: number | null;
+  winnerId: string | null;
+  players: GeoPlayerState[];
+  history: GeoRoundHistoryEntry[];
+  createdAt: number;
+}
+
+const geoRooms = new Map<string, GeoRoomState>();
+const geoQueue: Array<{
+  id: string;
+  name: string;
+  ws: WebSocket;
+  format: GeoOnlineFormat;
+  mapId: GeoMapId;
+  moveMode: GeoMoveMode;
+  roundTimeSec: number;
+  joinedAt: number;
+}> = [];
+
+function generateGeoRoomCode(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return geoRooms.has(code) ? generateGeoRoomCode() : code;
+}
+
+function serializeGeoRoom(room: GeoRoomState, viewerId: string) {
+  const isRevealPhase = room.status === 'round_result' || room.status === 'match_over';
+  const lastRound = room.history.length > 0 ? room.history[room.history.length - 1] : null;
+  return {
+    roomCode: room.roomCode,
+    hostId: room.hostId,
+    youId: viewerId,
+    format: room.format,
+    mapId: room.mapId,
+    moveMode: room.moveMode,
+    roundTimeSec: room.roundTimeSec,
+    status: room.status,
+    currentRound: room.currentRound,
+    maxRounds: room.maxRounds,
+    multiplier: room.format === 'duels' ? getDuelMultiplier(room.currentRound) : 1.0,
+    target:
+      room.status === 'lobby'
+        ? null
+        : isRevealPhase
+        ? room.target
+        : {
+            lat: room.target.lat,
+            lng: room.target.lng,
+            heading: room.target.heading,
+            panoId: room.target.panoId,
+            sdUrl: room.target.sdUrl,
+            az: room.target.az,
+          },
+    roundStartedAt: room.roundStartedAt,
+    roundDeadlineAt: room.roundDeadlineAt,
+    countdownEndAt: room.countdownEndAt,
+    winnerId: room.winnerId,
+    players: room.players.map((p) => ({
+      id: p.id,
+      name: p.name,
+      hp: p.hp,
+      totalScore: p.totalScore,
+      hasGuessed: p.guess !== null,
+      guess: isRevealPhase || p.id === viewerId ? p.guess : null,
+      readyForNext: p.readyForNext,
+      wantsRematch: p.wantsRematch,
+      connected: p.connected,
+    })),
+    lastRound,
+    history: isRevealPhase ? room.history : [],
+  };
+}
+
+function broadcastGeoRoom(room: GeoRoomState) {
+  room.players.forEach((p) => {
+    if (p.ws.readyState === WebSocket.OPEN) {
+      p.ws.send(
+        JSON.stringify({
+          type: 'geo_room_state',
+          room: serializeGeoRoom(room, p.id),
+        })
+      );
+    }
+  });
+}
+
+function startGeoRound(room: GeoRoomState, roundNumber: number) {
+  const picked = pickRandomMapLocations(room.mapId, 1)[0];
+  const now = Date.now();
+  room.status = 'playing';
+  room.currentRound = roundNumber;
+  room.target = {
+    lat: picked.lat,
+    lng: picked.lng,
+    heading: picked.heading,
+    panoId: picked.panoId,
+    sdUrl: picked.sdUrl,
+    az: picked.az,
+  };
+  room.roundStartedAt = now;
+  room.roundDeadlineAt = room.roundTimeSec > 0 ? now + room.roundTimeSec * 1000 : null;
+  room.countdownEndAt = null;
+  room.players.forEach((p) => {
+    p.guess = null;
+    p.softPin = null;
+    p.guessedAt = null;
+    p.readyForNext = false;
+    p.wantsRematch = false;
+  });
+  broadcastGeoRoom(room);
+}
+
+function resolveGeoRound(room: GeoRoomState) {
+  if (room.status !== 'playing') return;
+  const mapCfg = GEOGUESSR_MAPS[room.mapId] || GEOGUESSR_MAPS.world;
+  const multiplier = room.format === 'duels' ? getDuelMultiplier(room.currentRound) : 1.0;
+
+  // Auto-submit soft pins if a player placed one before timeout
+  room.players.forEach((p) => {
+    if (!p.guess && p.softPin) {
+      p.guess = p.softPin;
+    }
+  });
+
+  const roundScores = room.players.map((p) => {
+    if (!p.guess) {
+      return { id: p.id, guess: null, distanceKm: null, score: 0 };
+    }
+    const distanceKm = haversineDistanceKm(p.guess, room.target);
+    const score = calculateGeoScore(distanceKm, mapCfg.scaleKm);
+    return { id: p.id, guess: p.guess, distanceKm, score };
+  });
+
+  const p0 = room.players[0];
+  const p1 = room.players[1];
+  const s0 = roundScores[0]?.score ?? 0;
+  const s1 = roundScores[1]?.score ?? 0;
+
+  if (p0) p0.totalScore += s0;
+  if (p1) p1.totalScore += s1;
+
+  let dmgTo0 = 0;
+  let dmgTo1 = 0;
+
+  if (room.format === 'duels' && p0 && p1) {
+    if (s0 > s1) {
+      dmgTo1 = Math.round((s0 - s1) * multiplier);
+      p1.hp = Math.max(0, p1.hp - dmgTo1);
+    } else if (s1 > s0) {
+      dmgTo0 = Math.round((s1 - s0) * multiplier);
+      p0.hp = Math.max(0, p0.hp - dmgTo0);
+    }
+  }
+
+  const results: GeoRoundHistoryEntry['results'] = {};
+  if (p0) {
+    results[p0.id] = {
+      guess: roundScores[0].guess,
+      distanceKm: roundScores[0].distanceKm,
+      score: s0,
+      damageDealt: dmgTo1,
+      damageTaken: dmgTo0,
+    };
+  }
+  if (p1) {
+    results[p1.id] = {
+      guess: roundScores[1].guess,
+      distanceKm: roundScores[1].distanceKm,
+      score: s1,
+      damageDealt: dmgTo0,
+      damageTaken: dmgTo1,
+    };
+  }
+
+  room.history.push({
+    roundNumber: room.currentRound,
+    actual: { ...room.target },
+    multiplier,
+    results,
+  });
+
+  // Check match end conditions
+  if (room.format === 'duels' && p0 && p1 && (p0.hp <= 0 || p1.hp <= 0)) {
+    room.status = 'match_over';
+    room.winnerId = p0.hp > p1.hp ? p0.id : p1.id;
+  } else if (room.format === 'classic5' && room.currentRound >= room.maxRounds) {
+    room.status = 'match_over';
+    if (p0 && p1) {
+      if (p0.totalScore > p1.totalScore) room.winnerId = p0.id;
+      else if (p1.totalScore > p0.totalScore) room.winnerId = p1.id;
+      else room.winnerId = null; // Draw
+    }
+  } else {
+    room.status = 'round_result';
+  }
+
+  room.countdownEndAt = null;
+  room.roundDeadlineAt = null;
+  broadcastGeoRoom(room);
+}
+
+function removePlayerFromGeoQueue(playerId: string) {
+  const idx = geoQueue.findIndex((q) => q.id === playerId);
+  if (idx !== -1) {
+    geoQueue.splice(idx, 1);
+  }
+}
+
+function leavePlayerGeoRoom(playerId: string) {
+  geoRooms.forEach((room, code) => {
+    const idx = room.players.findIndex((p) => p.id === playerId);
+    if (idx !== -1) {
+      room.players.splice(idx, 1);
+      if (room.players.length === 0) {
+        geoRooms.delete(code);
+      } else {
+        room.hostId = room.players[0].id;
+        room.players.forEach((remaining) => {
+          if (remaining.ws.readyState === WebSocket.OPEN) {
+            remaining.ws.send(
+              JSON.stringify({
+                type: 'geo_opponent_left',
+                roomCode: code,
+              })
+            );
+          }
+        });
+        if (room.status === 'playing' || room.status === 'round_result') {
+          room.status = 'match_over';
+          room.winnerId = room.players[0].id;
+        }
+        broadcastGeoRoom(room);
+      }
+    }
+  });
+}
+
+setInterval(() => {
+  const now = Date.now();
+  geoRooms.forEach((room) => {
+    if (room.status === 'playing') {
+      const effectiveDeadline =
+        room.countdownEndAt && room.roundDeadlineAt
+          ? Math.min(room.countdownEndAt, room.roundDeadlineAt)
+          : room.countdownEndAt || room.roundDeadlineAt;
+      if (effectiveDeadline && now >= effectiveDeadline) {
+        resolveGeoRound(room);
+      }
+    }
+  });
+}, 500);
+
 
 const app = express();
 
@@ -17,7 +368,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-passcode');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
@@ -26,8 +377,11 @@ app.use((req, res, next) => {
 
 // WeTalks Shared Database Types & Helpers
 interface WeTalksUser {
+  id?: string;
   username: string;
-  password_numeric: string;
+  password_numeric?: string;
+  password_hash?: string;
+  token?: string;
   avatar_base64: string;
 }
 
@@ -35,6 +389,15 @@ interface WeTalksRoom {
   id: string;
   name: string;
   type: string;
+  members?: string[];
+  created_by?: string;
+}
+
+interface WeTalksReplyRef {
+  id: string;
+  sender: string;
+  text: string;
+  has_image?: boolean;
 }
 
 interface WeTalksMessage {
@@ -42,6 +405,10 @@ interface WeTalksMessage {
   room_id: string;
   sender: string;
   text: string;
+  image_base64?: string;
+  image_expired?: boolean;
+  reply_to?: WeTalksReplyRef | null;
+  read_by?: string[];
   created_at: string;
 }
 
@@ -49,31 +416,68 @@ interface WeTalksDB {
   users: WeTalksUser[];
   rooms: WeTalksRoom[];
   messages: WeTalksMessage[];
+  deleted_rooms?: string[];
 }
 
 const DB_FILE = path.join(process.cwd(), 'wetalks_db.json');
+const IMAGE_RETENTION_DAYS = 10;
+const IMAGE_RETENTION_MS = IMAGE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const ADMIN_PASSCODES = new Set(['mozunbu1203']);
+if (process.env.ADMIN_PASSCODE && process.env.ADMIN_PASSCODE.trim()) {
+  ADMIN_PASSCODES.add(process.env.ADMIN_PASSCODE.trim());
+}
+
+function pruneExpiredWeTalksImages(db: WeTalksDB): number {
+  const now = Date.now();
+  let pruned = 0;
+  if (!Array.isArray(db.messages)) return 0;
+  db.messages.forEach(m => {
+    if (m && m.image_base64) {
+      const createdMs = Date.parse(m.created_at || '');
+      if (!Number.isNaN(createdMs) && now - createdMs >= IMAGE_RETENTION_MS) {
+        delete m.image_base64;
+        m.image_expired = true;
+        pruned++;
+      }
+    }
+  });
+  if (pruned > 0) {
+    writeWeTalksDB(db);
+  }
+  return pruned;
+}
+
+function isAdminAuthorized(req: express.Request): boolean {
+  const headerCode = req.headers['x-admin-passcode'];
+  const queryCode = req.query.passcode;
+  const bodyCode = req.body && req.body.passcode;
+  const code = String(headerCode || queryCode || bodyCode || '').trim();
+  return ADMIN_PASSCODES.has(code);
+}
 
 function readWeTalksDB(): WeTalksDB {
-  const defaultRooms: WeTalksRoom[] = [
-    { id: 'room-general', name: '全般グループ', type: 'group' },
-    { id: 'room-random', name: '雑談トーク', type: 'group' },
-    { id: 'room-announcements', name: 'お知らせ', type: 'group' }
-  ];
+  const defaultRooms: WeTalksRoom[] = [];
 
   try {
     if (fs.existsSync(DB_FILE)) {
       const data = fs.readFileSync(DB_FILE, 'utf-8');
       const db: WeTalksDB = JSON.parse(data);
-      if (!db.rooms || db.rooms.length === 0) {
-        db.rooms = defaultRooms;
+      if (!db.deleted_rooms) db.deleted_rooms = [];
+      if (!Array.isArray(db.users)) db.users = [];
+      if (!Array.isArray(db.messages)) db.messages = [];
+      if (!db.rooms) {
+        db.rooms = defaultRooms.filter(r => !db.deleted_rooms!.includes(r.id));
         writeWeTalksDB(db);
+      } else {
+        db.rooms = db.rooms.filter(r => !db.deleted_rooms!.includes(r.id));
       }
+      pruneExpiredWeTalksImages(db);
       return db;
     }
   } catch (e) {
     console.error('Error reading wetalks db:', e);
   }
-  const initialDB: WeTalksDB = { users: [], rooms: defaultRooms, messages: [] };
+  const initialDB: WeTalksDB = { users: [], rooms: defaultRooms, messages: [], deleted_rooms: [] };
   writeWeTalksDB(initialDB);
   return initialDB;
 }
@@ -86,100 +490,1608 @@ function writeWeTalksDB(db: WeTalksDB) {
   }
 }
 
+function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${derived}`;
+}
+
+function verifyPassword(password: string, user: WeTalksUser): boolean {
+  if (user.password_hash) {
+    const [salt, storedHash] = user.password_hash.split(':');
+    if (!salt || !storedHash) return false;
+    const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+    try {
+      return crypto.timingSafeEqual(Buffer.from(derived, 'hex'), Buffer.from(storedHash, 'hex'));
+    } catch {
+      return false;
+    }
+  }
+  if (user.password_numeric) {
+    return user.password_numeric === password;
+  }
+  return false;
+}
+
+function getRequestToken(req: express.Request): string {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+  if (req.body && req.body.token) {
+    return String(req.body.token).trim();
+  }
+  return '';
+}
+
+function authenticateUser(req: express.Request, db: WeTalksDB): WeTalksUser | null {
+  const token = getRequestToken(req);
+  if (!token) return null;
+  return db.users.find(u => u.token && u.token === token) || null;
+}
+
+function isUserMemberOfRoom(room: WeTalksRoom, username: string): boolean {
+  if (!room || !username || username === 'ゲスト') return false;
+  if (Array.isArray(room.members)) {
+    return room.members.includes(username);
+  }
+  if (room.type === 'direct' && room.name) {
+    const parts = room.name.replace(/@/g, '').split(' & ');
+    return parts.length === 2 && (parts[0] === username || parts[1] === username);
+  }
+  return false;
+}
+
+function markRoomMessagesAsRead(db: WeTalksDB, roomId: string, readerUsername: string): number {
+  if (!roomId || !readerUsername || readerUsername === 'ゲスト') return 0;
+  let updatedCount = 0;
+  db.messages.forEach(m => {
+    if (m && m.room_id === roomId && m.sender !== readerUsername) {
+      const current = Array.isArray(m.read_by) ? m.read_by.filter(u => u && u !== m.sender) : [];
+      if (!current.includes(readerUsername)) {
+        current.push(readerUsername);
+        m.read_by = current;
+        updatedCount++;
+      } else if (!Array.isArray(m.read_by)) {
+        m.read_by = current;
+      }
+    }
+  });
+  if (updatedCount > 0) {
+    writeWeTalksDB(db);
+  }
+  return updatedCount;
+}
+
 // WeTalks API Routes
-app.get('/api/wetalks/users', (req, res) => {
-  const db = readWeTalksDB();
-  res.json(db.users);
+app.get('/api/wetalks/health', async (_req, res) => {
+  const usingTurso = hasTursoConfig();
+  let tursoConnected = false;
+  let tursoError = '';
+  if (usingTurso) {
+    try {
+      await ensureTursoSchema();
+      tursoConnected = true;
+    } catch (e: any) {
+      tursoError = e?.message || 'Turso connection failed';
+    }
+  }
+  res.json({
+    status: 'ok',
+    service: 'WeTalks Express Server',
+    hasTurso: usingTurso,
+    tursoConnected,
+    ...(tursoError ? { tursoError } : {}),
+    primaryStorage: usingTurso ? 'turso' : 'local_json',
+    imageRetentionDays: TURSO_IMAGE_RETENTION_DAYS,
+    time: new Date().toISOString(),
+  });
 });
 
-app.post('/api/wetalks/users', (req, res) => {
-  const { username, password_numeric, avatar_base64 } = req.body;
-  if (!username || !password_numeric) {
-    return res.status(400).json({ error: 'Username and password required' });
+app.get('/api/wetalks/users', async (_req, res) => {
+  try {
+    if (hasTursoConfig()) {
+      const users = await tursoListPublicUsers();
+      return res.json(users);
+    }
+    const db = readWeTalksDB();
+    return res.json(
+      db.users.map(u => ({
+        username: u.username,
+        avatar_base64: u.avatar_base64 || ''
+      }))
+    );
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'ユーザー一覧の取得に失敗しました。' });
   }
-  const db = readWeTalksDB();
-  const lowerUser = username.toLowerCase().trim();
-  if (db.users.some(u => u.username.toLowerCase().trim() === lowerUser)) {
-    return res.status(400).json({ error: 'Username already exists' });
-  }
-  const newUser = {
-    username,
-    password_numeric,
-    avatar_base64: avatar_base64 || ''
-  };
-  db.users.push(newUser);
-  writeWeTalksDB(db);
-  res.json({ success: true, user: newUser });
 });
 
-app.post('/api/wetalks/users/avatar', (req, res) => {
-  const { username, avatar_base64 } = req.body;
-  if (!username) {
-    return res.status(400).json({ error: 'Username required' });
+async function handleRegisterUser(req: express.Request, res: express.Response) {
+  try {
+    const { username, password, password_numeric, avatar_base64 } = req.body || {};
+    const cleanUsername = String(username || '').trim();
+    const rawPassword = String(password ?? password_numeric ?? '').trim();
+
+    if (!cleanUsername || !rawPassword) {
+      return res.status(400).json({ error: 'ユーザー名とパスワードを入力してください。' });
+    }
+    if (cleanUsername === 'ゲスト') {
+      return res.status(400).json({ error: 'このユーザー名は使用できません。' });
+    }
+    if (cleanUsername.length > 24) {
+      return res.status(400).json({ error: 'ユーザー名は24文字以内で入力してください。' });
+    }
+    if (rawPassword.length < 4) {
+      return res.status(400).json({ error: 'パスワードは4文字以上で入力してください。' });
+    }
+
+    if (hasTursoConfig()) {
+      const reg = await tursoRegisterUser(cleanUsername, rawPassword, String(avatar_base64 || ''));
+      if (reg.conflict) {
+        return res.status(409).json({ error: 'このユーザー名は既に登録されています。' });
+      }
+      return res.json({
+        success: true,
+        token: reg.token,
+        user: reg.user,
+      });
+    }
+
+    const db = readWeTalksDB();
+    const lowerUser = cleanUsername.toLowerCase();
+    if (db.users.some(u => u.username.toLowerCase().trim() === lowerUser)) {
+      return res.status(409).json({ error: 'このユーザー名は既に登録されています。' });
+    }
+
+    const token = crypto.randomBytes(24).toString('hex');
+    const newUser: WeTalksUser = {
+      id: 'u-' + Date.now() + '-' + crypto.randomBytes(4).toString('hex'),
+      username: cleanUsername,
+      password_hash: hashPassword(rawPassword),
+      token,
+      avatar_base64: avatar_base64 || ''
+    };
+    db.users.push(newUser);
+    writeWeTalksDB(db);
+    return res.json({
+      success: true,
+      token,
+      user: {
+        username: newUser.username,
+        avatar_base64: newUser.avatar_base64
+      }
+    });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || '登録に失敗しました。' });
   }
-  const db = readWeTalksDB();
-  const idx = db.users.findIndex(u => u.username.toLowerCase().trim() === username.toLowerCase().trim());
-  if (idx !== -1) {
-    db.users[idx].avatar_base64 = avatar_base64 || '';
+}
+
+app.post('/api/wetalks/register', handleRegisterUser);
+app.post('/api/wetalks/users', handleRegisterUser);
+
+app.post('/api/wetalks/login', async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+    const cleanUsername = String(username || '').trim();
+    const rawPassword = String(password || '').trim();
+    if (!cleanUsername || !rawPassword) {
+      return res.status(400).json({ error: 'ユーザー名とパスワードを入力してください。' });
+    }
+
+    if (hasTursoConfig()) {
+      const loggedIn = await tursoLoginUser(cleanUsername, rawPassword);
+      if (!loggedIn) {
+        return res.status(401).json({ error: 'ユーザー名またはパスワードが正しくありません。' });
+      }
+      return res.json({
+        success: true,
+        token: loggedIn.token,
+        user: loggedIn.user,
+      });
+    }
+
+    const db = readWeTalksDB();
+    const user = db.users.find(u => u.username.toLowerCase().trim() === cleanUsername.toLowerCase());
+    if (!user || !verifyPassword(rawPassword, user)) {
+      return res.status(401).json({ error: 'ユーザー名またはパスワードが正しくありません。' });
+    }
+    if (!user.token) {
+      user.token = crypto.randomBytes(24).toString('hex');
+      writeWeTalksDB(db);
+    }
+    return res.json({
+      success: true,
+      token: user.token,
+      user: {
+        username: user.username,
+        avatar_base64: user.avatar_base64 || ''
+      }
+    });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'ログインに失敗しました。' });
+  }
+});
+
+app.get('/api/wetalks/auth/me', async (req, res) => {
+  try {
+    if (hasTursoConfig()) {
+      const user = await tursoGetUserByToken(getRequestToken(req));
+      if (!user) return res.status(401).json({ error: '認証が必要です。' });
+      return res.json({
+        success: true,
+        user: { username: user.username, avatar_base64: user.avatar_base64 || '' },
+      });
+    }
+    const db = readWeTalksDB();
+    const user = authenticateUser(req, db);
+    if (!user) {
+      return res.status(401).json({ error: '認証が必要です。' });
+    }
+    return res.json({
+      success: true,
+      user: {
+        username: user.username,
+        avatar_base64: user.avatar_base64 || ''
+      }
+    });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || '認証確認に失敗しました。' });
+  }
+});
+
+app.post('/api/wetalks/auth/me', async (req, res) => {
+  try {
+    if (hasTursoConfig()) {
+      const user = await tursoGetUserByToken(getRequestToken(req));
+      if (!user) return res.status(401).json({ error: '認証が必要です。' });
+      return res.json({
+        success: true,
+        user: { username: user.username, avatar_base64: user.avatar_base64 || '' },
+      });
+    }
+    const db = readWeTalksDB();
+    const user = authenticateUser(req, db);
+    if (!user) {
+      return res.status(401).json({ error: '認証が必要です。' });
+    }
+    return res.json({
+      success: true,
+      user: {
+        username: user.username,
+        avatar_base64: user.avatar_base64 || ''
+      }
+    });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || '認証確認に失敗しました。' });
+  }
+});
+
+app.post('/api/wetalks/users/avatar', async (req, res) => {
+  try {
+    const { avatar_base64 } = req.body || {};
+    if (hasTursoConfig()) {
+      const authUser = await tursoGetUserByToken(getRequestToken(req));
+      if (!authUser) {
+        return res.status(401).json({ error: 'ログインが必要です。' });
+      }
+      await tursoUpdateAvatar(authUser.username, String(avatar_base64 || ''));
+      return res.json({ success: true });
+    }
+    const db = readWeTalksDB();
+    const authUser = authenticateUser(req, db);
+    if (!authUser) {
+      return res.status(401).json({ error: 'ログインが必要です。' });
+    }
+    authUser.avatar_base64 = avatar_base64 || '';
     writeWeTalksDB(db);
     return res.json({ success: true });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'アバター更新に失敗しました。' });
   }
-  res.status(404).json({ error: 'User not found' });
 });
 
-app.get('/api/wetalks/rooms', (req, res) => {
-  const db = readWeTalksDB();
-  res.json(db.rooms);
-});
+app.post('/api/wetalks/users/rename', async (req, res) => {
+  try {
+    const { newUsername } = req.body || {};
+    const newTrimmed = String(newUsername || '').trim();
+    if (!newTrimmed) {
+      return res.status(400).json({ error: '新しいユーザー名を入力してください。' });
+    }
+    if (newTrimmed === 'ゲスト') {
+      return res.status(400).json({ error: 'このユーザー名は使用できません。' });
+    }
+    if (newTrimmed.length > 24) {
+      return res.status(400).json({ error: 'ユーザー名は24文字以内で入力してください。' });
+    }
 
-app.post('/api/wetalks/rooms', (req, res) => {
-  const { id, name, type } = req.body;
-  if (!id || !name || !type) {
-    return res.status(400).json({ error: 'Missing fields' });
+    if (hasTursoConfig()) {
+      const authUser = await tursoGetUserByToken(getRequestToken(req));
+      if (!authUser) {
+        return res.status(401).json({ error: 'ログインが必要です。再ログインしてください。' });
+      }
+      if (newTrimmed === authUser.username) {
+        return res.json({ success: true, username: newTrimmed });
+      }
+      const renamed = await tursoRenameUser(authUser.username, newTrimmed);
+      if (renamed.conflict) {
+        return res.status(409).json({ error: 'このユーザー名は既に使用されているため変更できません。' });
+      }
+      return res.json({ success: true, username: newTrimmed });
+    }
+
+    const db = readWeTalksDB();
+    const authUser = authenticateUser(req, db);
+    if (!authUser) {
+      return res.status(401).json({ error: 'ログインが必要です。再ログインしてください。' });
+    }
+
+    const oldName = authUser.username;
+    if (newTrimmed === oldName) {
+      return res.json({ success: true, username: newTrimmed });
+    }
+
+    const conflict = db.users.some(
+      u =>
+        u !== authUser &&
+        u.username.toLowerCase().trim() === newTrimmed.toLowerCase()
+    );
+    if (conflict) {
+      return res.status(409).json({ error: 'このユーザー名は既に使用されているため変更できません。' });
+    }
+
+    authUser.username = newTrimmed;
+    db.messages.forEach(m => {
+      if (m.sender === oldName) {
+        m.sender = newTrimmed;
+      }
+      if (m.reply_to && m.reply_to.sender === oldName) {
+        m.reply_to.sender = newTrimmed;
+      }
+      if (Array.isArray(m.read_by) && m.read_by.includes(oldName)) {
+        m.read_by = Array.from(new Set(m.read_by.map(r => (r === oldName ? newTrimmed : r)).filter(r => r && r !== m.sender)));
+      }
+    });
+    db.rooms.forEach(r => {
+      if (r.created_by === oldName) {
+        r.created_by = newTrimmed;
+      }
+      if (Array.isArray(r.members)) {
+        r.members = Array.from(new Set(r.members.map(m => (m === oldName ? newTrimmed : m))));
+      }
+      if (r.type === 'direct' && r.name) {
+        const parts = r.name.replace(/@/g, '').split(' & ');
+        if (parts.length === 2 && (parts[0] === oldName || parts[1] === oldName)) {
+          const updatedParts = parts.map(p => (p === oldName ? newTrimmed : p)).sort();
+          r.name = '@' + updatedParts[0] + ' & @' + updatedParts[1];
+        }
+      }
+    });
+    writeWeTalksDB(db);
+    return res.json({ success: true, username: newTrimmed });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'ユーザー名変更に失敗しました。' });
   }
-  const db = readWeTalksDB();
-  if (db.rooms.some(r => r.id === id)) {
-    return res.json({ success: true, room: db.rooms.find(r => r.id === id) });
+});
+
+const wetalksPresence = new Map<string, { username: string; roomId: string | null; lastSeen: number }>();
+
+app.post('/api/wetalks/presence', async (req, res) => {
+  try {
+    const { clientId, username, roomId, offline } = req.body || {};
+    if (hasTursoConfig()) {
+      const authUser = await tursoGetUserByToken(getRequestToken(req));
+      const resolvedName = authUser ? authUser.username : String(username || '').trim();
+      const result = await tursoSyncPresence(
+        String(clientId || '').trim(),
+        resolvedName,
+        roomId ? String(roomId) : '',
+        offline === true
+      );
+      return res.json(result);
+    }
+
+    const db = readWeTalksDB();
+    const authUser = authenticateUser(req, db);
+    const resolvedName = authUser ? authUser.username : String(username || '').trim();
+    const now = Date.now();
+    if (offline && clientId) {
+      wetalksPresence.delete(String(clientId));
+    } else if (clientId && resolvedName && resolvedName !== 'ゲスト') {
+      wetalksPresence.set(String(clientId), {
+        username: resolvedName,
+        roomId: roomId ? String(roomId) : null,
+        lastSeen: now
+      });
+    }
+    for (const [key, val] of wetalksPresence.entries()) {
+      if (now - val.lastSeen > 20000) {
+        wetalksPresence.delete(key);
+      }
+    }
+    const activeClients = Array.from(wetalksPresence.values());
+    const userMap = new Map<string, string>();
+    activeClients.forEach(c => {
+      const uname = String(c.username || '').trim();
+      if (uname && uname !== 'ゲスト') {
+        const k = uname.toLowerCase();
+        if (!userMap.has(k)) userMap.set(k, uname);
+      }
+    });
+    const onlineUsers = Array.from(userMap.values());
+    const roomMembers = roomId
+      ? Array.from(new Set(activeClients.filter(c => c.roomId === roomId && c.username !== 'ゲスト').map(c => c.username)))
+      : [];
+    const fallbackSelf = (!offline && resolvedName && resolvedName !== 'ゲスト') ? 1 : 0;
+    return res.json({
+      presenceSupported: true,
+      onlineCount: onlineUsers.length > 0 ? onlineUsers.length : fallbackSelf,
+      onlineUsers,
+      roomMembers
+    });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'プレゼンス更新に失敗しました。' });
   }
-  const newRoom = { id, name, type };
-  db.rooms.push(newRoom);
-  writeWeTalksDB(db);
-  res.json({ success: true, room: newRoom });
 });
 
-app.delete('/api/wetalks/rooms/:id', (req, res) => {
-  const { id } = req.params;
-  const db = readWeTalksDB();
-  db.rooms = db.rooms.filter(r => r.id !== id);
-  db.messages = db.messages.filter(m => m.room_id !== id);
-  writeWeTalksDB(db);
-  res.json({ success: true });
-});
-
-app.get('/api/wetalks/messages/:roomId', (req, res) => {
-  const { roomId } = req.params;
-  const db = readWeTalksDB();
-  const msgs = db.messages.filter(m => m.room_id === roomId);
-  res.json(msgs);
-});
-
-app.post('/api/wetalks/messages', (req, res) => {
-  const { room_id, sender, text } = req.body;
-  if (!room_id || !sender || !text) {
-    return res.status(400).json({ error: 'Missing fields' });
+app.get('/api/wetalks/rooms', async (req, res) => {
+  try {
+    if (hasTursoConfig()) {
+      const authUser = await tursoGetUserByToken(getRequestToken(req));
+      if (!authUser) return res.json([]);
+      const rooms = await tursoGetRoomsForUser(authUser.username);
+      return res.json(rooms);
+    }
+    const db = readWeTalksDB();
+    const authUser = authenticateUser(req, db);
+    if (!authUser) {
+      return res.json([]);
+    }
+    const visibleRooms = db.rooms.filter(r => isUserMemberOfRoom(r, authUser.username));
+    return res.json(visibleRooms);
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'ルーム取得に失敗しました。' });
   }
-  const db = readWeTalksDB();
-  const newMsg = {
-    id: 'm-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4),
-    room_id,
-    sender,
-    text,
-    created_at: new Date().toISOString()
+});
+
+app.post('/api/wetalks/rooms', async (req, res) => {
+  try {
+    const { id, name, type, members } = req.body || {};
+    if (!id || !name || !type) {
+      return res.status(400).json({ error: 'Missing fields' });
+    }
+
+    if (hasTursoConfig()) {
+      const authUser = await tursoGetUserByToken(getRequestToken(req));
+      if (!authUser) {
+        return res.status(401).json({ error: 'ログインが必要です。' });
+      }
+      const created = await tursoCreateRoom(authUser.username, { id, name, type, members });
+      if ('error' in created && created.error) {
+        return res.status(created.status || 400).json({ error: created.error });
+      }
+      return res.json({ success: true, room: created.room });
+    }
+
+    const db = readWeTalksDB();
+    const authUser = authenticateUser(req, db);
+    if (!authUser) {
+      return res.status(401).json({ error: 'ログインが必要です。' });
+    }
+    if (!db.deleted_rooms) db.deleted_rooms = [];
+    db.deleted_rooms = db.deleted_rooms.filter(delId => delId !== id);
+
+    if (type === 'direct') {
+      const memberSet = new Set<string>([authUser.username]);
+      if (Array.isArray(members)) {
+        members.forEach((m: unknown) => {
+          const s = String(m || '').trim();
+          if (s && s !== 'ゲスト') memberSet.add(s);
+        });
+      }
+      if (memberSet.size < 2 && typeof name === 'string') {
+        const parts = name.replace(/@/g, '').split(' & ').map(s => s.trim()).filter(Boolean);
+        parts.forEach(p => { if (p !== 'ゲスト') memberSet.add(p); });
+      }
+      const finalMembers = Array.from(memberSet).slice(0, 2);
+      if (finalMembers.length !== 2) {
+        return res.status(400).json({ error: '1対1トークには相手のユーザーが必要です。' });
+      }
+      const sorted = [...finalMembers].sort();
+      const canonicalName = '@' + sorted[0] + ' & @' + sorted[1];
+      const existingDirect = db.rooms.find(r => {
+        if (r.type !== 'direct') return false;
+        if (Array.isArray(r.members) && r.members.length === 2) {
+          return r.members.includes(sorted[0]) && r.members.includes(sorted[1]);
+        }
+        return r.name === canonicalName;
+      });
+      if (existingDirect) {
+        if (!Array.isArray(existingDirect.members)) {
+          existingDirect.members = sorted;
+          writeWeTalksDB(db);
+        }
+        return res.json({ success: true, room: existingDirect });
+      }
+      const existingById = db.rooms.find(r => r.id === id);
+      if (existingById) {
+        return res.json({ success: true, room: existingById });
+      }
+      const newDirectRoom: WeTalksRoom = {
+        id,
+        name: canonicalName,
+        type: 'direct',
+        members: sorted,
+        created_by: authUser.username
+      };
+      db.rooms.push(newDirectRoom);
+      writeWeTalksDB(db);
+      return res.json({ success: true, room: newDirectRoom });
+    }
+
+    const existing = db.rooms.find(r => r.id === id);
+    if (existing) {
+      if (!isUserMemberOfRoom(existing, authUser.username)) {
+        return res.status(403).json({ error: 'このルームにアクセスする権限がありません。' });
+      }
+      return res.json({ success: true, room: existing });
+    }
+
+    const registeredUsernames = new Set(db.users.map(u => u.username));
+    const memberSet = new Set<string>([authUser.username]);
+    if (Array.isArray(members)) {
+      members.forEach((m: unknown) => {
+        const s = String(m || '').trim();
+        if (s && s !== 'ゲスト' && registeredUsernames.has(s)) {
+          memberSet.add(s);
+        }
+      });
+    }
+    const newRoom: WeTalksRoom = {
+      id,
+      name: String(name).trim(),
+      type: 'group',
+      members: Array.from(memberSet),
+      created_by: authUser.username
+    };
+    db.rooms.push(newRoom);
+    writeWeTalksDB(db);
+    return res.json({ success: true, room: newRoom });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'ルーム作成に失敗しました。' });
+  }
+});
+
+app.post('/api/wetalks/rooms/:id/invite', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { members, username } = req.body || {};
+    const candidates: string[] = [];
+    if (Array.isArray(members)) {
+      members.forEach((m: unknown) => candidates.push(String(m || '').trim()));
+    }
+    if (username) {
+      candidates.push(String(username).trim());
+    }
+
+    if (hasTursoConfig()) {
+      const authUser = await tursoGetUserByToken(getRequestToken(req));
+      if (!authUser) {
+        return res.status(401).json({ error: 'ログインが必要です。' });
+      }
+      const invited = await tursoInviteToRoom(id, authUser.username, candidates);
+      if ('error' in invited && invited.error) {
+        return res.status(invited.status || 400).json({ error: invited.error });
+      }
+      return res.json({ success: true, room: invited.room, addedMembers: invited.addedMembers });
+    }
+
+    const db = readWeTalksDB();
+    const authUser = authenticateUser(req, db);
+    if (!authUser) {
+      return res.status(401).json({ error: 'ログインが必要です。' });
+    }
+    const room = db.rooms.find(r => r.id === id);
+    if (!room) {
+      return res.status(404).json({ error: 'トークルームが見つかりません。' });
+    }
+    if (room.type !== 'group') {
+      return res.status(400).json({ error: 'グループトークのみメンバーを招待できます。' });
+    }
+    if (!isUserMemberOfRoom(room, authUser.username)) {
+      return res.status(403).json({ error: 'このグループのメンバーのみ招待できます。' });
+    }
+
+    const registeredUsernames = new Set(db.users.map(u => u.username));
+    const currentMembers = Array.isArray(room.members) ? [...room.members] : [authUser.username];
+    const memberSet = new Set<string>(currentMembers);
+    const addedMembers: string[] = [];
+    candidates.forEach(c => {
+      if (c && c !== 'ゲスト' && registeredUsernames.has(c) && !memberSet.has(c)) {
+        memberSet.add(c);
+        addedMembers.push(c);
+      }
+    });
+    room.members = Array.from(memberSet);
+    writeWeTalksDB(db);
+    return res.json({ success: true, room, addedMembers });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || '招待に失敗しました。' });
+  }
+});
+
+app.delete('/api/wetalks/rooms/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (hasTursoConfig()) {
+      await tursoDeleteRoom(id);
+      return res.json({ success: true });
+    }
+    const db = readWeTalksDB();
+    if (!db.deleted_rooms) db.deleted_rooms = [];
+    if (!db.deleted_rooms.includes(id)) {
+      db.deleted_rooms.push(id);
+    }
+    db.rooms = db.rooms.filter(r => r.id !== id);
+    db.messages = db.messages.filter(m => m.room_id !== id);
+    writeWeTalksDB(db);
+    return res.json({ success: true });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'ルーム削除に失敗しました。' });
+  }
+});
+
+app.post('/api/wetalks/rooms/:id/read', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (hasTursoConfig()) {
+      const authUser = await tursoGetUserByToken(getRequestToken(req));
+      if (!authUser) {
+        return res.status(401).json({ error: 'ログインが必要です。' });
+      }
+      const room = await tursoGetRoomById(id);
+      if (room && !isMemberOfTursoRoom(room, authUser.username)) {
+        return res.status(403).json({ error: 'このトークルームを閲覧する権限がありません。' });
+      }
+      const updatedCount = await tursoMarkMessagesRead(id, authUser.username);
+      if (updatedCount > 0) {
+        broadcastWetalksEvent('read', id);
+      }
+      return res.json({ success: true, updatedCount });
+    }
+
+    const db = readWeTalksDB();
+    const authUser = authenticateUser(req, db);
+    if (!authUser) {
+      return res.status(401).json({ error: 'ログインが必要です。' });
+    }
+    const room = db.rooms.find(r => r.id === id);
+    if (room && !isUserMemberOfRoom(room, authUser.username)) {
+      return res.status(403).json({ error: 'このトークルームを閲覧する権限がありません。' });
+    }
+    const updatedCount = markRoomMessagesAsRead(db, id, authUser.username);
+    if (updatedCount > 0) {
+      broadcastWetalksEvent('read', id);
+    }
+    return res.json({ success: true, updatedCount });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || '既読更新に失敗しました。' });
+  }
+});
+
+app.get('/api/wetalks/messages/:roomId', async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const markRead = req.query.markRead === '1' || req.query.markRead === 'true';
+    const isSummary = req.query.summary === '1' || req.query.summary === 'true';
+
+    if (hasTursoConfig()) {
+      const authUser = await tursoGetUserByToken(getRequestToken(req));
+      if (!authUser) {
+        return res.status(401).json({ error: 'ログインが必要です。' });
+      }
+      const room = await tursoGetRoomById(roomId);
+      if (room && !isMemberOfTursoRoom(room, authUser.username)) {
+        return res.status(403).json({ error: 'このトークルームを閲覧する権限がありません。' });
+      }
+      if (markRead) {
+        const updatedCount = await tursoMarkMessagesRead(roomId, authUser.username);
+        if (updatedCount > 0) {
+          broadcastWetalksEvent('read', roomId);
+        }
+      }
+      const msgs = await tursoGetMessagesForRoom(roomId, { summary: isSummary });
+      return res.json(msgs);
+    }
+
+    const db = readWeTalksDB();
+    const authUser = authenticateUser(req, db);
+    if (!authUser) {
+      return res.status(401).json({ error: 'ログインが必要です。' });
+    }
+    const room = db.rooms.find(r => r.id === roomId);
+    if (room && !isUserMemberOfRoom(room, authUser.username)) {
+      return res.status(403).json({ error: 'このトークルームを閲覧する権限がありません。' });
+    }
+    if (markRead) {
+      const updatedCount = markRoomMessagesAsRead(db, roomId, authUser.username);
+      if (updatedCount > 0) {
+        broadcastWetalksEvent('read', roomId);
+      }
+    }
+    let filtered = db.messages.filter(m => m.room_id === roomId);
+    if (isSummary && filtered.length > 30) {
+      filtered = filtered.slice(-30);
+    }
+    const msgs = filtered.map(m => {
+      const cleanReadBy = Array.isArray(m.read_by) ? m.read_by.filter(u => u && u !== m.sender) : [];
+      if (isSummary) {
+        return {
+          id: m.id,
+          room_id: m.room_id,
+          sender: m.sender,
+          text: m.text,
+          has_image: !!m.image_base64,
+          image_expired: !!m.image_expired,
+          read_by: cleanReadBy,
+          created_at: m.created_at
+        };
+      }
+      return {
+        ...m,
+        read_by: cleanReadBy
+      };
+    });
+    return res.json(msgs);
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'メッセージ取得に失敗しました。' });
+  }
+});
+
+app.post('/api/wetalks/messages', async (req, res) => {
+  try {
+    const { id, room_id, text, image_base64, reply_to, created_at } = req.body || {};
+    const cleanText = String(text || '').trim();
+    const cleanImage = typeof image_base64 === 'string' ? image_base64.trim() : '';
+    if (!room_id || (!cleanText && !cleanImage)) {
+      return res.status(400).json({ error: 'Missing fields' });
+    }
+    if (cleanImage) {
+      if (!/^data:image\/(png|jpeg|jpg|gif|webp|bmp);base64,[A-Za-z0-9+/=]+$/i.test(cleanImage)) {
+        return res.status(400).json({ error: '無効な画像形式です。' });
+      }
+      if (cleanImage.length > 5 * 1024 * 1024) {
+        return res.status(413).json({ error: '画像サイズが大きすぎます。' });
+      }
+    }
+
+    let cleanReply: WeTalksReplyRef | null = null;
+    if (reply_to && typeof reply_to === 'object' && reply_to.id) {
+      cleanReply = {
+        id: String(reply_to.id).slice(0, 120),
+        sender: String(reply_to.sender || '').slice(0, 40),
+        text: String(reply_to.text || '').slice(0, 200),
+        ...(reply_to.has_image ? { has_image: true } : {})
+      };
+    }
+
+    if (hasTursoConfig()) {
+      const authUser = await tursoGetUserByToken(getRequestToken(req));
+      if (!authUser) {
+        return res.status(401).json({ error: 'ログインが必要です。' });
+      }
+      const room = await tursoGetRoomById(room_id);
+      if (room && !isMemberOfTursoRoom(room, authUser.username)) {
+        return res.status(403).json({ error: 'このトークルームに送信する権限がありません。' });
+      }
+      const msgId = id || ('m-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4));
+      const newMsg = {
+        id: msgId,
+        room_id,
+        sender: authUser.username,
+        text: cleanText,
+        image_base64: cleanImage,
+        ...(cleanReply ? { reply_to: cleanReply } : {}),
+        read_by: [] as string[],
+        created_at: created_at || new Date().toISOString()
+      };
+      await tursoInsertMessage(newMsg);
+      broadcastWetalksEvent('message', room_id, {
+        message: {
+          id: newMsg.id,
+          room_id,
+          sender: authUser.username,
+          text: cleanText.slice(0, 300),
+          has_image: !!cleanImage,
+          created_at: newMsg.created_at
+        },
+        roomName: room?.name || '',
+        members: Array.isArray(room?.members) ? room.members : undefined
+      });
+      return res.json({ success: true, message: newMsg });
+    }
+
+    const db = readWeTalksDB();
+    const authUser = authenticateUser(req, db);
+    if (!authUser) {
+      return res.status(401).json({ error: 'ログインが必要です。' });
+    }
+    const room = db.rooms.find(r => r.id === room_id);
+    if (room && !isUserMemberOfRoom(room, authUser.username)) {
+      return res.status(403).json({ error: 'このトークルームに送信する権限がありません。' });
+    }
+    const msgId = id || ('m-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4));
+    const existing = db.messages.find(m => m.id === msgId);
+    if (existing) {
+      return res.json({ success: true, message: existing });
+    }
+    const newMsg: WeTalksMessage = {
+      id: msgId,
+      room_id,
+      sender: authUser.username,
+      text: cleanText,
+      ...(cleanImage ? { image_base64: cleanImage } : {}),
+      ...(cleanReply ? { reply_to: cleanReply } : {}),
+      read_by: [],
+      created_at: created_at || new Date().toISOString()
+    };
+    db.messages.push(newMsg);
+    writeWeTalksDB(db);
+    broadcastWetalksEvent('message', room_id, {
+      message: {
+        id: newMsg.id,
+        room_id,
+        sender: authUser.username,
+        text: cleanText.slice(0, 300),
+        has_image: !!cleanImage,
+        created_at: newMsg.created_at
+      },
+      roomName: room?.name || '',
+      members: Array.isArray(room?.members) ? room.members : undefined
+    });
+    return res.json({ success: true, message: newMsg });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'メッセージ送信に失敗しました。' });
+  }
+});
+
+// Admin Overview & Management Routes
+app.get('/api/wetalks/admin/overview', async (req, res) => {
+  if (!isAdminAuthorized(req)) {
+    return res.status(401).json({ error: '管理者認証が必要です。' });
+  }
+  try {
+    if (hasTursoConfig()) {
+      const overview = await tursoGetAdminOverview();
+      return res.json(overview);
+    }
+
+    const db = readWeTalksDB();
+    const roomMap = new Map(db.rooms.map(r => [r.id, r.name]));
+    const imagesCount = db.messages.filter(m => !!m.image_base64).length;
+
+    const users = db.users.map(u => ({
+      username: u.username,
+      has_password: !!(u.password_hash || u.password_numeric),
+      password_storage: u.password_hash ? 'scrypt暗号化保存済み' : (u.password_numeric ? '保存済み' : '未設定'),
+      avatar_base64: u.avatar_base64 || ''
+    }));
+
+    const rooms = db.rooms.map(r => ({
+      id: r.id,
+      name: r.name,
+      type: r.type,
+      members: Array.isArray(r.members) ? r.members : [],
+      message_count: db.messages.filter(m => m.room_id === r.id).length
+    }));
+
+    const recentMessages = db.messages
+      .slice(-50)
+      .reverse()
+      .map(m => {
+        const createdMs = Date.parse(m.created_at || '');
+        const expiresAt = m.image_base64 && !Number.isNaN(createdMs)
+          ? new Date(createdMs + IMAGE_RETENTION_MS).toISOString()
+          : null;
+        return {
+          id: m.id,
+          room_id: m.room_id,
+          room_name: roomMap.get(m.room_id) || m.room_id,
+          sender: m.sender,
+          text: m.text,
+          has_image: !!m.image_base64,
+          image_base64: m.image_base64 || '',
+          image_expired: !!m.image_expired,
+          created_at: m.created_at,
+          image_expires_at: expiresAt
+        };
+      });
+
+    return res.json({
+      success: true,
+      backend: '内蔵 Express サーバー (wetalks_db.json)',
+      hasTurso: false,
+      storage_verified: true,
+      image_retention_days: IMAGE_RETENTION_DAYS,
+      checked_at: new Date().toISOString(),
+      counts: {
+        users: db.users.length,
+        rooms: db.rooms.length,
+        messages: db.messages.length,
+        images: imagesCount
+      },
+      users,
+      rooms,
+      recent_messages: recentMessages
+    });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || '管理概要の取得に失敗しました。' });
+  }
+});
+
+app.post('/api/wetalks/admin/prune-images', async (req, res) => {
+  if (!isAdminAuthorized(req)) {
+    return res.status(401).json({ error: '管理者認証が必要です。' });
+  }
+  try {
+    if (hasTursoConfig()) {
+      const prunedCount = await tursoPruneExpiredImages(true);
+      return res.json({ success: true, prunedCount });
+    }
+    const db = readWeTalksDB();
+    const prunedCount = pruneExpiredWeTalksImages(db);
+    const remainingImages = db.messages.filter(m => !!m.image_base64).length;
+    return res.json({ success: true, prunedCount, remainingImages });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || '画像整理に失敗しました。' });
+  }
+});
+
+app.delete('/api/wetalks/admin/messages/:id', async (req, res) => {
+  if (!isAdminAuthorized(req)) {
+    return res.status(401).json({ error: '管理者認証が必要です。' });
+  }
+  try {
+    const { id } = req.params;
+    if (hasTursoConfig()) {
+      await tursoDeleteMessage(id);
+      return res.json({ success: true });
+    }
+    const db = readWeTalksDB();
+    const before = db.messages.length;
+    db.messages = db.messages.filter(m => m.id !== id);
+    if (db.messages.length !== before) {
+      writeWeTalksDB(db);
+    }
+    return res.json({ success: true });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'メッセージ削除に失敗しました。' });
+  }
+});
+
+app.delete('/api/wetalks/admin/users/:username', async (req, res) => {
+  if (!isAdminAuthorized(req)) {
+    return res.status(401).json({ error: '管理者認証が必要です。' });
+  }
+  try {
+    const target = String(req.params.username || '').trim().toLowerCase();
+    if (hasTursoConfig()) {
+      await tursoDeleteUser(target);
+      return res.json({ success: true });
+    }
+    const db = readWeTalksDB();
+    const before = db.users.length;
+    db.users = db.users.filter(u => u.username.toLowerCase().trim() !== target);
+    if (db.users.length !== before) {
+      writeWeTalksDB(db);
+    }
+    return res.json({ success: true });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'ユーザー削除に失敗しました。' });
+  }
+});
+
+app.get('/api/wetalks/admin/rooms/:id/messages', async (req, res) => {
+  if (!isAdminAuthorized(req)) {
+    return res.status(401).json({ error: '管理者認証が必要です。' });
+  }
+  try {
+    const roomId = req.params.id;
+    if (hasTursoConfig()) {
+      const result = await tursoGetAdminRoomMessages(roomId);
+      return res.json(result);
+    }
+    const db = readWeTalksDB();
+    const room = db.rooms.find(r => r.id === roomId) || null;
+    const messages = db.messages
+      .filter(m => m.room_id === roomId)
+      .map(m => {
+        const createdMs = Date.parse(m.created_at || '');
+        const expiresAt = m.image_base64 && !Number.isNaN(createdMs)
+          ? new Date(createdMs + IMAGE_RETENTION_MS).toISOString()
+          : null;
+        return {
+          ...m,
+          has_image: !!m.image_base64,
+          image_expires_at: expiresAt,
+          read_by: Array.isArray(m.read_by) ? m.read_by.filter(u => u && u !== m.sender) : []
+        };
+      });
+    return res.json({ success: true, room, messages });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'ルームメッセージ取得に失敗しました。' });
+  }
+});
+
+// Admin Export / Import & Cloudflare -> Turso Migration Routes
+app.get('/api/wetalks/admin/export', async (req, res) => {
+  if (!isAdminAuthorized(req)) {
+    return res.status(401).json({ error: '管理者認証が必要です。' });
+  }
+  try {
+    if (hasTursoConfig()) {
+      const bundle = await tursoExportBundle();
+      return res.json({ success: true, source: 'turso', exportedAt: new Date().toISOString(), ...bundle });
+    }
+    const db = readWeTalksDB();
+    const broadcasts = readBroadcasts();
+    return res.json({
+      success: true,
+      source: 'local_json',
+      exportedAt: new Date().toISOString(),
+      users: db.users,
+      rooms: db.rooms,
+      messages: db.messages,
+      deleted_rooms: db.deleted_rooms || [],
+      broadcasts,
+    });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'エクスポートに失敗しました。' });
+  }
+});
+
+app.post('/api/wetalks/admin/import', async (req, res) => {
+  if (!isAdminAuthorized(req)) {
+    return res.status(401).json({ error: '管理者認証が必要です。' });
+  }
+  try {
+    const bundle = req.body || {};
+    if (hasTursoConfig()) {
+      const summary = await tursoImportBundle(bundle);
+      return res.json({ success: true, target: 'turso', ...summary });
+    }
+    const db = readWeTalksDB();
+    let usersImported = 0;
+    let roomsImported = 0;
+    let messagesImported = 0;
+    let broadcastsImported = 0;
+    const existingUsers = new Set(db.users.map(u => u.username.toLowerCase()));
+    for (const u of bundle.users || []) {
+      const uname = String(u?.username || '').trim();
+      if (!uname || existingUsers.has(uname.toLowerCase())) continue;
+      existingUsers.add(uname.toLowerCase());
+      db.users.push({
+        username: uname,
+        password_numeric: String(u.password_numeric || ''),
+        password_hash: String(u.password_hash || ''),
+        token: String(u.token || crypto.randomBytes(24).toString('hex')),
+        avatar_base64: String(u.avatar_base64 || ''),
+      });
+      usersImported++;
+    }
+    const existingRoomIds = new Set(db.rooms.map(r => r.id));
+    for (const r of bundle.rooms || []) {
+      if (!r?.id || existingRoomIds.has(r.id)) continue;
+      existingRoomIds.add(r.id);
+      db.rooms.push({
+        id: String(r.id),
+        name: String(r.name || ''),
+        type: String(r.type || 'group'),
+        members: Array.isArray(r.members) ? r.members.map(String) : [],
+        created_by: String(r.created_by || ''),
+      });
+      roomsImported++;
+    }
+    const existingMsgIds = new Set(db.messages.map(m => m.id));
+    for (const m of bundle.messages || []) {
+      if (!m?.id || existingMsgIds.has(m.id)) continue;
+      existingMsgIds.add(m.id);
+      db.messages.push(m);
+      messagesImported++;
+    }
+    writeWeTalksDB(db);
+    if (Array.isArray(bundle.broadcasts) && bundle.broadcasts.length > 0) {
+      const bcs = readBroadcasts();
+      const bcIds = new Set(bcs.map(b => b.id));
+      for (const bc of bundle.broadcasts) {
+        if (bc?.id && !bcIds.has(bc.id)) {
+          bcIds.add(bc.id);
+          bcs.push(bc);
+          broadcastsImported++;
+        }
+      }
+      writeBroadcasts(bcs);
+    }
+    return res.json({
+      success: true,
+      target: 'local_json',
+      usersImported,
+      roomsImported,
+      messagesImported,
+      deletedRoomsImported: 0,
+      broadcastsImported,
+    });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'インポートに失敗しました。' });
+  }
+});
+
+app.post('/api/wetalks/admin/migrate-from-cloudflare', async (req, res) => {
+  if (!isAdminAuthorized(req)) {
+    return res.status(401).json({ error: '管理者認証が必要です。' });
+  }
+  try {
+    const rawWorkerUrl = String(req.body?.workerUrl || '').trim().replace(/\/+$/, '');
+    const sourcePasscode = String(req.body?.sourcePasscode || req.body?.passcode || req.headers['x-admin-passcode'] || 'mozunbu1203').trim();
+    if (!rawWorkerUrl) {
+      return res.status(400).json({ error: '移行元の Cloudflare Worker URL を入力してください。' });
+    }
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(rawWorkerUrl);
+    } catch {
+      return res.status(400).json({ error: '無効な Worker URL 形式です。' });
+    }
+    if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+      return res.status(400).json({ error: 'HTTP/HTTPS の Worker URL を指定してください。' });
+    }
+    if (isPrivateOrDisallowedHost(parsedUrl.hostname)) {
+      return res.status(400).json({ error: 'プライベートまたはローカルホストへの移行リクエストは許可されていません。' });
+    }
+    const base = parsedUrl.origin;
+
+    let bundle: any = null;
+    // 1. Try worker's dedicated /api/wetalks/admin/export endpoint
+    const exportResp = await fetch(`${base}/api/wetalks/admin/export?passcode=${encodeURIComponent(sourcePasscode)}`, {
+      headers: { 'x-admin-passcode': sourcePasscode },
+    }).catch(() => null);
+
+    if (exportResp && exportResp.ok) {
+      bundle = await exportResp.json().catch(() => null);
+    } else if (exportResp && exportResp.status >= 400) {
+      const errBody = await exportResp.json().catch(() => ({} as any));
+      const errText = String(errBody?.error || '');
+      if (errText.includes('D1_ERROR') || errText.toLowerCase().includes('limit')) {
+        return res.status(429).json({
+          error: 'Cloudflare D1 の無料枠読み取り上限に達しているため API 経由の読み出しがブロックされています。CLI の `npx wrangler d1 export wetalks-db --remote --output=d1-export.sql` でエクスポートしたファイル、または既存のバックアップ JSON をお使いください。',
+          d1LimitReached: true,
+        });
+      }
+    }
+
+    // 2. Fallback to admin overview if legacy worker didn't have /export yet
+    if (!bundle || !Array.isArray(bundle.users)) {
+      const ovResp = await fetch(`${base}/api/wetalks/admin/overview?passcode=${encodeURIComponent(sourcePasscode)}`, {
+        headers: { 'x-admin-passcode': sourcePasscode },
+      });
+      const ovData: any = await ovResp.json().catch(() => ({}));
+      if (!ovResp.ok) {
+        const msg = String(ovData?.error || `HTTP ${ovResp.status}`);
+        if (msg.includes('D1_ERROR') || msg.toLowerCase().includes('limit')) {
+          return res.status(429).json({
+            error: 'Cloudflare D1 の無料枠上限に到達しています。D1 SQL エクスポート (`wrangler d1 export`) または JSON ファイルから移行できます。',
+            d1LimitReached: true,
+          });
+        }
+        return res.status(ovResp.status || 502).json({ error: `移行元 Worker からの取得に失敗: ${msg}` });
+      }
+      const rooms = Array.isArray(ovData.rooms) ? ovData.rooms : [];
+      const allMessages: any[] = [];
+      for (const r of rooms) {
+        try {
+          const rmResp = await fetch(`${base}/api/wetalks/admin/rooms/${encodeURIComponent(r.id)}/messages?passcode=${encodeURIComponent(sourcePasscode)}`, {
+            headers: { 'x-admin-passcode': sourcePasscode },
+          });
+          if (rmResp.ok) {
+            const rmData: any = await rmResp.json().catch(() => ({}));
+            if (Array.isArray(rmData.messages)) {
+              allMessages.push(...rmData.messages);
+            }
+          }
+        } catch {}
+      }
+      let broadcasts: any[] = [];
+      try {
+        const bcResp = await fetch(`${base}/api/admin/broadcasts`);
+        if (bcResp.ok) {
+          const bcData = await bcResp.json();
+          if (Array.isArray(bcData)) broadcasts = bcData;
+        }
+      } catch {}
+      bundle = {
+        users: Array.isArray(ovData.users) ? ovData.users : [],
+        rooms,
+        messages: allMessages,
+        broadcasts,
+      };
+    }
+
+    if (hasTursoConfig()) {
+      const summary = await tursoImportBundle(bundle);
+      return res.json({ success: true, target: 'turso', ...summary });
+    }
+    return res.status(400).json({ error: 'サーバーに TURSO_DATABASE_URL / TURSO_AUTH_TOKEN が設定されていません。' });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'Cloudflare からの移行に失敗しました。' });
+  }
+});
+
+// In-Memory HTTP Call Signaling & Game Relay fallback (used when Turso is not configured on Express)
+interface HttpCallSignalEntry {
+  id: number;
+  roomId: string;
+  fromPeerId: string;
+  targetPeerId: string;
+  signalType: string;
+  payload: any;
+  createdAt: number;
+}
+const httpCallRooms = new Map<string, Map<string, { peerId: string; username: string; camOn: boolean; micOn: boolean; lastSeen: number }>>();
+const httpCallSignals = new Map<string, HttpCallSignalEntry[]>();
+let httpCallSignalSeq = 1;
+
+function getMergedCallParticipants(roomId: string) {
+  const now = Date.now();
+  const map = new Map<string, { peerId: string; username: string; camOn: boolean; micOn: boolean }>();
+  const wsPeers = wetalksCallRooms.get(roomId);
+  if (wsPeers) {
+    wsPeers.forEach((p) => {
+      map.set(p.peerId, { peerId: p.peerId, username: p.username, camOn: p.camOn, micOn: p.micOn });
+    });
+  }
+  const httpPeers = httpCallRooms.get(roomId);
+  if (httpPeers) {
+    for (const [pid, p] of httpPeers.entries()) {
+      if (now - p.lastSeen > 12000) {
+        httpPeers.delete(pid);
+      } else {
+        map.set(p.peerId, { peerId: p.peerId, username: p.username, camOn: p.camOn, micOn: p.micOn });
+      }
+    }
+  }
+  return Array.from(map.values());
+}
+
+function pushHttpCallSignal(roomId: string, fromPeerId: string, targetPeerId: string, signalType: string, payload: any) {
+  const list = httpCallSignals.get(roomId) || [];
+  const entry: HttpCallSignalEntry = {
+    id: httpCallSignalSeq++,
+    roomId,
+    fromPeerId,
+    targetPeerId: targetPeerId || '*',
+    signalType,
+    payload,
+    createdAt: Date.now(),
   };
-  db.messages.push(newMsg);
-  writeWeTalksDB(db);
-  res.json({ success: true, message: newMsg });
+  list.push(entry);
+  const cutoff = Date.now() - 90000;
+  httpCallSignals.set(roomId, list.filter((s) => s.createdAt >= cutoff).slice(-200));
+  return entry.id;
+}
+
+const handleCallProbe = async (req: express.Request, res: express.Response) => {
+  try {
+    const roomId = String(req.query.roomId || req.body?.roomId || '').trim();
+    if (!roomId) return res.json({ success: true, roomId: '', participants: [] });
+    if (hasTursoConfig()) {
+      const participants = await tursoProbeCallParticipants(roomId);
+      const merged = new Map(participants.map((p) => [p.peerId, p]));
+      getWetalksCallParticipants(roomId).forEach((p) => {
+        if (!merged.has(p.peerId)) merged.set(p.peerId, p);
+      });
+      return res.json({ success: true, roomId, participants: Array.from(merged.values()) });
+    }
+    return res.json({ success: true, roomId, participants: getMergedCallParticipants(roomId) });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || '通話状態の確認に失敗しました。' });
+  }
+};
+app.get('/api/wetalks/call/probe', handleCallProbe);
+app.post('/api/wetalks/call/probe', handleCallProbe);
+
+const handleCallJoin = async (req: express.Request, res: express.Response) => {
+  try {
+    const roomId = String(req.body?.roomId || '').trim();
+    const peerId = String(req.body?.peerId || '').trim();
+    const username = String(req.body?.username || 'User').trim().slice(0, 32);
+    const camOn = Boolean(req.body?.camOn);
+    const micOn = req.body?.micOn === true;
+    if (!roomId || !peerId) return res.status(400).json({ error: 'roomId and peerId are required' });
+
+    if (hasTursoConfig()) {
+      const participants = await tursoJoinCall(roomId, peerId, username, camOn, micOn);
+      return res.json({ success: true, roomId, peerId, participants });
+    }
+    let roomMap = httpCallRooms.get(roomId);
+    if (!roomMap) {
+      roomMap = new Map();
+      httpCallRooms.set(roomId, roomMap);
+    }
+    roomMap.set(peerId, { peerId, username, camOn, micOn, lastSeen: Date.now() });
+    const wsPeers = wetalksCallRooms.get(roomId);
+    if (wsPeers) {
+      const msg = JSON.stringify({ type: 'wetalks_call_peer_joined', roomId, peer: { peerId, username, camOn, micOn } });
+      wsPeers.forEach((p) => {
+        if (p.peerId !== peerId && p.ws.readyState === WebSocket.OPEN) {
+          try { p.ws.send(msg); } catch {}
+        }
+      });
+    }
+    return res.json({ success: true, roomId, peerId, participants: getMergedCallParticipants(roomId) });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || '通話参加に失敗しました。' });
+  }
+};
+app.post('/api/wetalks/call/join', handleCallJoin);
+app.post('/api/wetalks/call/heartbeat', handleCallJoin);
+
+app.post('/api/wetalks/call/media', async (req: express.Request, res: express.Response) => {
+  try {
+    const roomId = String(req.body?.roomId || '').trim();
+    const peerId = String(req.body?.peerId || '').trim();
+    const camOn = Boolean(req.body?.camOn);
+    const micOn = req.body?.micOn === true;
+    if (!roomId || !peerId) return res.status(400).json({ error: 'roomId and peerId are required' });
+    if (hasTursoConfig()) {
+      await tursoUpdateCallMedia(roomId, peerId, camOn, micOn);
+      return res.json({ success: true });
+    }
+    const roomMap = httpCallRooms.get(roomId);
+    const existing = roomMap?.get(peerId);
+    if (existing) {
+      existing.camOn = camOn;
+      existing.micOn = micOn;
+      existing.lastSeen = Date.now();
+    }
+    const wsPeers = wetalksCallRooms.get(roomId);
+    if (wsPeers) {
+      const msg = JSON.stringify({ type: 'wetalks_call_media_state', roomId, peerId, camOn, micOn });
+      wsPeers.forEach((p) => {
+        if (p.peerId !== peerId && p.ws.readyState === WebSocket.OPEN) {
+          try { p.ws.send(msg); } catch {}
+        }
+      });
+    }
+    return res.json({ success: true });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'メディア状態更新に失敗しました。' });
+  }
 });
+
+app.post('/api/wetalks/call/leave', async (req: express.Request, res: express.Response) => {
+  try {
+    const roomId = String(req.body?.roomId || '').trim();
+    const peerId = String(req.body?.peerId || '').trim();
+    if (!roomId || !peerId) return res.json({ success: true });
+    if (hasTursoConfig()) {
+      await tursoLeaveCall(roomId, peerId);
+      return res.json({ success: true });
+    }
+    httpCallRooms.get(roomId)?.delete(peerId);
+    pushHttpCallSignal(roomId, peerId, '*', 'peer_left', { peerId });
+    const wsPeers = wetalksCallRooms.get(roomId);
+    if (wsPeers) {
+      const msg = JSON.stringify({ type: 'wetalks_call_peer_left', roomId, peerId });
+      wsPeers.forEach((p) => {
+        if (p.peerId !== peerId && p.ws.readyState === WebSocket.OPEN) {
+          try { p.ws.send(msg); } catch {}
+        }
+      });
+    }
+    return res.json({ success: true });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || '通話退出に失敗しました。' });
+  }
+});
+
+app.post('/api/wetalks/call/signal', async (req: express.Request, res: express.Response) => {
+  try {
+    const roomId = String(req.body?.roomId || '').trim();
+    const fromPeerId = String(req.body?.fromPeerId || '').trim();
+    const targetPeerId = String(req.body?.targetPeerId || '*').trim();
+    const signalType = String(req.body?.signalType || 'webrtc').trim();
+    const signalPayload = req.body?.signal ?? req.body?.payload ?? {};
+    if (!roomId || !fromPeerId) return res.status(400).json({ error: 'roomId and fromPeerId are required' });
+
+    if (hasTursoConfig()) {
+      const signalId = await tursoSendCallSignal(roomId, fromPeerId, targetPeerId, signalType, signalPayload);
+      return res.json({ success: true, signalId });
+    }
+
+    const signalId = pushHttpCallSignal(roomId, fromPeerId, targetPeerId, signalType, signalPayload);
+    // Bridge to local WS peers if any
+    const wsPeers = wetalksCallRooms.get(roomId);
+    if (wsPeers && signalType === 'webrtc') {
+      const targetWs = wsPeers.get(targetPeerId);
+      if (targetWs && targetWs.ws.readyState === WebSocket.OPEN) {
+        try {
+          targetWs.ws.send(JSON.stringify({ type: 'wetalks_call_signal', roomId, fromPeerId, signal: signalPayload }));
+        } catch {}
+      }
+    }
+    return res.json({ success: true, signalId });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'シグナル送信に失敗しました。' });
+  }
+});
+
+app.get('/api/wetalks/call/signals', async (req: express.Request, res: express.Response) => {
+  try {
+    const roomId = String(req.query.roomId || '').trim();
+    const peerId = String(req.query.peerId || '').trim();
+    const afterId = Number(req.query.afterId || 0) || 0;
+    const doHeartbeat = req.query.heartbeat === '1' || req.query.heartbeat === 'true';
+    const username = doHeartbeat ? String(req.query.username || 'User').trim().slice(0, 32) : undefined;
+    const camOn = req.query.camOn === '1' || req.query.camOn === 'true';
+    const micOn = req.query.micOn === '1' || req.query.micOn === 'true';
+    if (!roomId || !peerId) return res.status(400).json({ error: 'roomId and peerId are required' });
+
+    if (hasTursoConfig()) {
+      const result = await tursoPollCallSignals(roomId, peerId, afterId, username, camOn, micOn);
+      return res.json({ success: true, ...result });
+    }
+
+    if (username) {
+      let roomMap = httpCallRooms.get(roomId);
+      if (!roomMap) {
+        roomMap = new Map();
+        httpCallRooms.set(roomId, roomMap);
+      }
+      roomMap.set(peerId, { peerId, username, camOn, micOn, lastSeen: Date.now() });
+    }
+    const participants = getMergedCallParticipants(roomId);
+    const rawList = httpCallSignals.get(roomId) || [];
+    let latestId = afterId;
+    const signals = rawList.filter((s) => {
+      if (s.id <= afterId || s.fromPeerId === peerId) return false;
+      if (s.targetPeerId !== peerId && s.targetPeerId !== '*') return false;
+      if (s.id > latestId) latestId = s.id;
+      return true;
+    });
+    return res.json({ success: true, participants, signals, latestId });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'シグナル取得に失敗しました。' });
+  }
+});
+
+// Game HTTP Relay Fallback (when WebSocket is unavailable, e.g., GitHub Pages -> Turso/Worker)
+const httpRelayMembers = new Map<string, Map<string, { memberId: string; username: string; lastSeen: number }>>();
+const httpRelayEvents = new Map<string, Array<{ id: number; fromMemberId: string; username: string; event: string; payload: any; includeSelf: boolean; createdAt: number }>>();
+let httpRelaySeq = 1;
+
+app.post('/api/relay/join', async (req, res) => {
+  try {
+    const channel = String(req.body?.channel || '').trim();
+    const memberId = String(req.body?.memberId || '').trim();
+    const username = String(req.body?.username || 'Player').trim().slice(0, 32);
+    if (!channel || !memberId) return res.status(400).json({ error: 'channel and memberId required' });
+    if (hasTursoConfig()) {
+      const resData = await tursoRelayJoin(channel, memberId, username);
+      return res.json({ success: true, channel, memberId, ...resData });
+    }
+    let memMap = httpRelayMembers.get(channel);
+    if (!memMap) {
+      memMap = new Map();
+      httpRelayMembers.set(channel, memMap);
+    }
+    memMap.set(memberId, { memberId, username, lastSeen: Date.now() });
+    const evList = httpRelayEvents.get(channel) || [];
+    const afterId = evList.length > 0 ? evList[evList.length - 1].id : 0;
+    evList.push({ id: httpRelaySeq++, fromMemberId: memberId, username, event: 'relay_member_joined', payload: { memberId, username }, includeSelf: false, createdAt: Date.now() });
+    httpRelayEvents.set(channel, evList.slice(-150));
+    return res.json({ success: true, channel, memberId, members: Array.from(memMap.values()), afterId });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'リレー参加に失敗しました。' });
+  }
+});
+
+app.post('/api/relay/send', async (req, res) => {
+  try {
+    const channel = String(req.body?.channel || '').trim();
+    const memberId = String(req.body?.memberId || '').trim();
+    const username = String(req.body?.username || 'Player').trim().slice(0, 32);
+    const event = String(req.body?.event || '').trim();
+    const payload = req.body?.payload ?? {};
+    const includeSelf = Boolean(req.body?.includeSelf);
+    if (!channel || !memberId || !event) return res.status(400).json({ error: 'Missing relay fields' });
+    if (hasTursoConfig()) {
+      const id = await tursoRelaySend(channel, memberId, username, event, payload, includeSelf);
+      return res.json({ success: true, id });
+    }
+    const evList = httpRelayEvents.get(channel) || [];
+    const id = httpRelaySeq++;
+    evList.push({ id, fromMemberId: memberId, username, event, payload, includeSelf, createdAt: Date.now() });
+    httpRelayEvents.set(channel, evList.slice(-150));
+    // Also forward to local WS relay clients on same channel
+    const wsMembers = relayChannels.get(channel);
+    if (wsMembers) {
+      const msg = JSON.stringify({ type: 'relay_event', channel, event, payload, fromMemberId: memberId });
+      wsMembers.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          try { client.send(msg); } catch {}
+        }
+      });
+    }
+    return res.json({ success: true, id });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'リレー送信に失敗しました。' });
+  }
+});
+
+app.get('/api/relay/poll', async (req, res) => {
+  try {
+    const channel = String(req.query.channel || '').trim();
+    const memberId = String(req.query.memberId || '').trim();
+    const username = String(req.query.username || 'Player').trim().slice(0, 32);
+    const afterId = Number(req.query.afterId || 0) || 0;
+    if (!channel || !memberId) return res.status(400).json({ error: 'channel and memberId required' });
+    if (hasTursoConfig()) {
+      const polled = await tursoRelayPoll(channel, memberId, username, afterId);
+      return res.json({ success: true, ...polled });
+    }
+    let memMap = httpRelayMembers.get(channel);
+    if (!memMap) {
+      memMap = new Map();
+      httpRelayMembers.set(channel, memMap);
+    }
+    memMap.set(memberId, { memberId, username, lastSeen: Date.now() });
+    const now = Date.now();
+    for (const [k, v] of memMap.entries()) {
+      if (now - v.lastSeen > 25000) memMap.delete(k);
+    }
+    const evList = httpRelayEvents.get(channel) || [];
+    let latestId = afterId;
+    const events = evList.filter((e) => {
+      if (e.id <= afterId) return false;
+      if (!e.includeSelf && e.fromMemberId === memberId) return false;
+      if (e.id > latestId) latestId = e.id;
+      return true;
+    });
+    return res.json({ success: true, events, members: Array.from(memMap.values()), latestId });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'リレー受信に失敗しました。' });
+  }
+});
+
+app.post('/api/relay/leave', async (req, res) => {
+  try {
+    const channel = String(req.body?.channel || '').trim();
+    const memberId = String(req.body?.memberId || '').trim();
+    const username = String(req.body?.username || 'Player').trim().slice(0, 32);
+    if (!channel || !memberId) return res.json({ success: true });
+    if (hasTursoConfig()) {
+      await tursoRelayLeave(channel, memberId, username);
+      return res.json({ success: true });
+    }
+    httpRelayMembers.get(channel)?.delete(memberId);
+    const evList = httpRelayEvents.get(channel) || [];
+    evList.push({ id: httpRelaySeq++, fromMemberId: memberId, username, event: 'relay_member_left', payload: { memberId, username }, includeSelf: false, createdAt: Date.now() });
+    httpRelayEvents.set(channel, evList.slice(-150));
+    return res.json({ success: true });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'リレー退出に失敗しました。' });
+  }
+});
+
+// Background hourly cleanup of 10-day-old images
+setInterval(() => {
+  try {
+    if (hasTursoConfig()) {
+      tursoPruneExpiredImages(true).catch(() => {});
+    } else if (fs.existsSync(DB_FILE)) {
+      readWeTalksDB();
+    }
+  } catch (e) {}
+}, 60 * 60 * 1000);
 
 interface TetrisClient {
   id: string;
@@ -292,6 +2204,14 @@ function rotateGridColors(room: GameRoom) {
       }
     }
   }
+  // Keep players' standing tile color synchronized when tiles rotate beneath them
+  Object.values(room.players).forEach((p) => {
+    const gx = Math.floor(p.x);
+    const gy = Math.floor(p.y);
+    if (gx >= 0 && gx < GRID_SIZE && gy >= 0 && gy < GRID_SIZE) {
+      p.targetColorIndex = room.grid[gy][gx];
+    }
+  });
 }
 
 // Bot simulation on the server to keep games active
@@ -440,40 +2360,519 @@ setInterval(() => {
   });
 }, 1000);
 
-// Set up WebSocket Server
+interface WsClientMeta {
+  clientId: string;
+  chameleonRoomId?: string;
+  relayChannel?: string;
+  relayMemberId?: string;
+  relayUsername?: string;
+  wetalksUsername?: string;
+  wetalksCallRoomId?: string;
+  wetalksCallPeerId?: string;
+}
+
+interface WetalksCallPeer {
+  peerId: string;
+  username: string;
+  camOn: boolean;
+  micOn: boolean;
+  ws: WebSocket;
+}
+
 const wss = new WebSocketServer({ noServer: true });
+const wsMetaMap = new WeakMap<WebSocket, WsClientMeta>();
+const relayChannels = new Map<string, Set<WebSocket>>();
+const wetalksWsClients = new Set<WebSocket>();
+const wetalksCallRooms = new Map<string, Map<string, WetalksCallPeer>>();
+
+function getWetalksCallParticipants(roomId: string) {
+  const peers = wetalksCallRooms.get(roomId);
+  if (!peers) return [];
+  return Array.from(peers.values()).map((p) => ({
+    peerId: p.peerId,
+    username: p.username,
+    camOn: p.camOn,
+    micOn: p.micOn,
+  }));
+}
+
+function broadcastWetalksCallRoster(roomId: string) {
+  if (!roomId) return;
+  const participants = getWetalksCallParticipants(roomId);
+  const payload = JSON.stringify({
+    type: 'wetalks_call_roster',
+    roomId,
+    participants,
+  });
+  wetalksWsClients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(payload);
+      } catch {}
+    }
+  });
+  const roomPeers = wetalksCallRooms.get(roomId);
+  if (roomPeers) {
+    roomPeers.forEach((p) => {
+      if (!wetalksWsClients.has(p.ws) && p.ws.readyState === WebSocket.OPEN) {
+        try {
+          p.ws.send(payload);
+        } catch {}
+      }
+    });
+  }
+}
+
+function leaveWetalksCall(ws: WebSocket, targetRoomId?: string) {
+  const meta = wsMetaMap.get(ws);
+  if (!meta) return;
+  const roomId = targetRoomId || meta.wetalksCallRoomId;
+  const peerId = meta.wetalksCallPeerId;
+  if (!roomId || !peerId) return;
+
+  const peers = wetalksCallRooms.get(roomId);
+  if (peers) {
+    const existing = peers.get(peerId);
+    if (!existing || existing.ws === ws) {
+      peers.delete(peerId);
+      const leavePayload = JSON.stringify({
+        type: 'wetalks_call_peer_left',
+        roomId,
+        peerId,
+      });
+      peers.forEach((p) => {
+        if (p.ws.readyState === WebSocket.OPEN) {
+          try {
+            p.ws.send(leavePayload);
+          } catch {}
+        }
+      });
+      if (peers.size === 0) {
+        wetalksCallRooms.delete(roomId);
+      }
+      broadcastWetalksCallRoster(roomId);
+    }
+  }
+  if (meta.wetalksCallRoomId === roomId) {
+    meta.wetalksCallRoomId = undefined;
+    meta.wetalksCallPeerId = undefined;
+  }
+}
+
+interface WeTalksEventMeta {
+  message?: {
+    id: string;
+    room_id: string;
+    sender: string;
+    text: string;
+    has_image?: boolean;
+    created_at?: string;
+  };
+  roomName?: string;
+  members?: string[];
+}
+
+function broadcastWetalksEvent(event: 'read' | 'message', roomId: string, meta?: WeTalksEventMeta) {
+  if (!roomId || wetalksWsClients.size === 0) return;
+  const membersList = Array.isArray(meta?.members) && meta.members.length > 0 ? meta.members : null;
+  const memberSet = membersList ? new Set(membersList) : null;
+  const basePayload = JSON.stringify({ type: 'wetalks_event', event, roomId });
+  const richPayload =
+    event === 'message' && meta?.message && memberSet
+      ? JSON.stringify({
+          type: 'wetalks_event',
+          event,
+          roomId,
+          message: meta.message,
+          roomName: meta.roomName || '',
+          members: membersList
+        })
+      : basePayload;
+
+  wetalksWsClients.forEach((client) => {
+    if (client.readyState !== WebSocket.OPEN) return;
+    const cMeta = wsMetaMap.get(client);
+    if (memberSet) {
+      if (!cMeta?.wetalksUsername || !memberSet.has(cMeta.wetalksUsername)) {
+        return;
+      }
+      try {
+        client.send(richPayload);
+      } catch {}
+      return;
+    }
+    try {
+      client.send(basePayload);
+    } catch {}
+  });
+}
+
+function leaveRelayChannel(ws: WebSocket, targetChannel?: string) {
+  const meta = wsMetaMap.get(ws);
+  if (!meta) return;
+  const channel = targetChannel || meta.relayChannel;
+  if (!channel) return;
+
+  const members = relayChannels.get(channel);
+  if (members) {
+    members.delete(ws);
+    const leavePayload = JSON.stringify({
+      type: 'relay_member_left',
+      channel,
+      memberId: meta.relayMemberId || meta.clientId,
+      username: meta.relayUsername || 'Player',
+    });
+    members.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(leavePayload);
+      }
+    });
+    if (members.size === 0) {
+      relayChannels.delete(channel);
+    }
+  }
+  if (meta.relayChannel === channel) {
+    meta.relayChannel = undefined;
+  }
+}
 
 server.on('upgrade', (request, socket, head) => {
+  const protocol = request.headers['sec-websocket-protocol'];
+  if (protocol === 'vite-hmr' || protocol === 'vite-ping') {
+    return;
+  }
   wss.handleUpgrade(request, socket, head, (ws) => {
     wss.emit('connection', ws, request);
   });
 });
 
 wss.on('connection', (ws: WebSocket) => {
-  let playerRoomId = 'default';
-  let playerId = Math.random().toString(36).substring(2, 9);
+  let playerRoomId = '';
+  const playerId = Math.random().toString(36).substring(2, 9);
+  wsMetaMap.set(ws, { clientId: playerId });
 
   ws.on('message', (message: string) => {
     try {
       const data = JSON.parse(message);
-      const room = getRoom(playerRoomId);
+      const meta = wsMetaMap.get(ws) || { clientId: playerId };
+      wsMetaMap.set(ws, meta);
 
       switch (data.type) {
+        case 'ping': {
+          ws.send(JSON.stringify({ type: 'pong' }));
+          break;
+        }
+
+        case 'wetalks_subscribe': {
+          const uname = typeof data.username === 'string' ? data.username.trim().slice(0, 64) : '';
+          meta.wetalksUsername = uname && uname !== 'ゲスト' ? uname : undefined;
+          wetalksWsClients.add(ws);
+          break;
+        }
+
+        case 'wetalks_notify_message': {
+          const roomId = typeof data.roomId === 'string' ? data.roomId.trim().slice(0, 120) : '';
+          if (!roomId || !data.message || typeof data.message !== 'object') break;
+          const rawMsg = data.message as Record<string, unknown>;
+          const msgId = typeof rawMsg.id === 'string' ? rawMsg.id.trim().slice(0, 120) : '';
+          const rawSender = typeof rawMsg.sender === 'string' ? rawMsg.sender.trim().slice(0, 64) : '';
+          const sender = meta.wetalksUsername || rawSender;
+          if (!msgId || !sender || sender === 'ゲスト') break;
+          if (meta.wetalksUsername && rawSender && rawSender !== meta.wetalksUsername) break;
+          const text = typeof rawMsg.text === 'string' ? rawMsg.text.trim().slice(0, 300) : '';
+          const hasImage = Boolean(rawMsg.has_image);
+          if (!text && !hasImage) break;
+          const createdAt = typeof rawMsg.created_at === 'string' ? rawMsg.created_at.slice(0, 40) : new Date().toISOString();
+          const roomName = typeof data.roomName === 'string' ? data.roomName.trim().slice(0, 100) : '';
+          let members: string[] | undefined;
+          if (Array.isArray(data.members)) {
+            const cleaned = data.members
+              .filter((m: unknown): m is string => typeof m === 'string')
+              .map((m: string) => m.trim().slice(0, 64))
+              .filter((m: string) => Boolean(m) && m !== 'ゲスト')
+              .slice(0, 50);
+            if (cleaned.length > 0 && cleaned.includes(sender)) {
+              members = cleaned;
+            }
+          }
+          broadcastWetalksEvent('message', roomId, {
+            message: { id: msgId, room_id: roomId, sender, text, has_image: hasImage, created_at: createdAt },
+            roomName,
+            members
+          });
+          break;
+        }
+
+        case 'wetalks_call_probe': {
+          const roomId = String(data.roomId || '').trim();
+          if (!roomId) break;
+          wetalksWsClients.add(ws);
+          ws.send(
+            JSON.stringify({
+              type: 'wetalks_call_roster',
+              roomId,
+              participants: getWetalksCallParticipants(roomId),
+            })
+          );
+          break;
+        }
+
+        case 'wetalks_call_join': {
+          const roomId = String(data.roomId || '').trim();
+          if (!roomId) break;
+          const peerId = String(data.peerId || playerId).trim();
+          const username = String(data.username || meta.wetalksUsername || 'User').slice(0, 32);
+          const camOn = Boolean(data.camOn);
+          const micOn = data.micOn !== false;
+
+          if (meta.wetalksCallRoomId && meta.wetalksCallRoomId !== roomId) {
+            leaveWetalksCall(ws, meta.wetalksCallRoomId);
+          }
+
+          meta.wetalksCallRoomId = roomId;
+          meta.wetalksCallPeerId = peerId;
+          wetalksWsClients.add(ws);
+
+          let peers = wetalksCallRooms.get(roomId);
+          if (!peers) {
+            peers = new Map<string, WetalksCallPeer>();
+            wetalksCallRooms.set(roomId, peers);
+          }
+
+          const peerEntry: WetalksCallPeer = { peerId, username, camOn, micOn, ws };
+          peers.set(peerId, peerEntry);
+
+          ws.send(
+            JSON.stringify({
+              type: 'wetalks_call_joined',
+              roomId,
+              peerId,
+              participants: getWetalksCallParticipants(roomId),
+            })
+          );
+
+          const joinedNotify = JSON.stringify({
+            type: 'wetalks_call_peer_joined',
+            roomId,
+            peer: { peerId, username, camOn, micOn },
+          });
+          peers.forEach((p) => {
+            if (p.peerId !== peerId && p.ws.readyState === WebSocket.OPEN) {
+              try {
+                p.ws.send(joinedNotify);
+              } catch {}
+            }
+          });
+          broadcastWetalksCallRoster(roomId);
+          break;
+        }
+
+        case 'wetalks_call_signal': {
+          const roomId = String(data.roomId || meta.wetalksCallRoomId || '').trim();
+          const targetPeerId = String(data.targetPeerId || '').trim();
+          const fromPeerId = String(meta.wetalksCallPeerId || data.fromPeerId || '').trim();
+          if (!roomId || !targetPeerId || !fromPeerId || !data.signal) break;
+          const peers = wetalksCallRooms.get(roomId);
+          const target = peers?.get(targetPeerId);
+          if (target && target.ws.readyState === WebSocket.OPEN) {
+            try {
+              target.ws.send(
+                JSON.stringify({
+                  type: 'wetalks_call_signal',
+                  roomId,
+                  fromPeerId,
+                  signal: data.signal,
+                })
+              );
+            } catch {}
+          }
+          break;
+        }
+
+        case 'wetalks_call_media_state': {
+          const roomId = String(data.roomId || meta.wetalksCallRoomId || '').trim();
+          const peerId = String(meta.wetalksCallPeerId || data.peerId || '').trim();
+          if (!roomId || !peerId) break;
+          const peers = wetalksCallRooms.get(roomId);
+          const peer = peers?.get(peerId);
+          if (!peer) break;
+          peer.camOn = Boolean(data.camOn);
+          peer.micOn = data.micOn !== false;
+          const stateMsg = JSON.stringify({
+            type: 'wetalks_call_media_state',
+            roomId,
+            peerId,
+            camOn: peer.camOn,
+            micOn: peer.micOn,
+          });
+          peers.forEach((p) => {
+            if (p.peerId !== peerId && p.ws.readyState === WebSocket.OPEN) {
+              try {
+                p.ws.send(stateMsg);
+              } catch {}
+            }
+          });
+          broadcastWetalksCallRoster(roomId);
+          break;
+        }
+
+        case 'wetalks_call_audio': {
+          const roomId = String(data.roomId || meta.wetalksCallRoomId || '').trim();
+          const fromPeerId = String(meta.wetalksCallPeerId || data.fromPeerId || '').trim();
+          const targetPeerId = typeof data.targetPeerId === 'string' ? data.targetPeerId.trim() : '';
+          const pcm = typeof data.pcm === 'string' ? data.pcm : '';
+          const sampleRate = Number(data.sampleRate) || 32000;
+          if (!roomId || !fromPeerId || !pcm || pcm.length > 32768) break;
+          if (sampleRate < 8000 || sampleRate > 48000) break;
+          const peers = wetalksCallRooms.get(roomId);
+          if (!peers || !peers.has(fromPeerId)) break;
+          const audioMsg = JSON.stringify({
+            type: 'wetalks_call_audio',
+            roomId,
+            fromPeerId,
+            sampleRate,
+            pcm
+          });
+          if (targetPeerId) {
+            const target = peers.get(targetPeerId);
+            if (target && target.peerId !== fromPeerId && target.ws.readyState === WebSocket.OPEN) {
+              try {
+                target.ws.send(audioMsg);
+              } catch {}
+            }
+          } else {
+            peers.forEach((p) => {
+              if (p.peerId !== fromPeerId && p.ws.readyState === WebSocket.OPEN) {
+                try {
+                  p.ws.send(audioMsg);
+                } catch {}
+              }
+            });
+          }
+          break;
+        }
+
+        case 'wetalks_call_need_ws_audio': {
+          const roomId = String(data.roomId || meta.wetalksCallRoomId || '').trim();
+          const fromPeerId = String(meta.wetalksCallPeerId || data.fromPeerId || '').trim();
+          const targetPeerId = typeof data.targetPeerId === 'string' ? data.targetPeerId.trim() : '';
+          if (!roomId || !fromPeerId || !targetPeerId) break;
+          const peers = wetalksCallRooms.get(roomId);
+          if (!peers || !peers.has(fromPeerId)) break;
+          const target = peers.get(targetPeerId);
+          if (target && target.peerId !== fromPeerId && target.ws.readyState === WebSocket.OPEN) {
+            try {
+              target.ws.send(JSON.stringify({
+                type: 'wetalks_call_need_ws_audio',
+                roomId,
+                fromPeerId
+              }));
+            } catch {}
+          }
+          break;
+        }
+
+        case 'wetalks_call_leave': {
+          const roomId = data.roomId ? String(data.roomId).trim() : undefined;
+          leaveWetalksCall(ws, roomId);
+          break;
+        }
+
+        case 'relay_join': {
+          const channel = String(data.channel || '').trim();
+          if (!channel) break;
+          if (meta.relayChannel && meta.relayChannel !== channel) {
+            leaveRelayChannel(ws, meta.relayChannel);
+          }
+
+          meta.relayChannel = channel;
+          meta.relayMemberId = String(data.memberId || playerId);
+          meta.relayUsername = String(data.username || 'Player');
+
+          let members = relayChannels.get(channel);
+          if (!members) {
+            members = new Set<WebSocket>();
+            relayChannels.set(channel, members);
+          }
+          members.add(ws);
+
+          const memberList = Array.from(members)
+            .map((client) => {
+              const cm = wsMetaMap.get(client);
+              return {
+                memberId: cm?.relayMemberId || cm?.clientId || '',
+                username: cm?.relayUsername || 'Player',
+              };
+            })
+            .filter((m) => !!m.memberId);
+
+          ws.send(
+            JSON.stringify({
+              type: 'relay_joined',
+              channel,
+              memberId: meta.relayMemberId,
+              members: memberList,
+            })
+          );
+
+          const joinNotify = JSON.stringify({
+            type: 'relay_member_joined',
+            channel,
+            memberId: meta.relayMemberId,
+            username: meta.relayUsername,
+          });
+          members.forEach((client) => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              client.send(joinNotify);
+            }
+          });
+          break;
+        }
+
+        case 'relay_broadcast': {
+          const channel = String(data.channel || meta.relayChannel || '').trim();
+          if (!channel || !data.event) break;
+          const members = relayChannels.get(channel);
+          if (!members) break;
+          const out = JSON.stringify({
+            type: 'relay_event',
+            channel,
+            event: data.event,
+            payload: data.payload ?? {},
+            fromMemberId: meta.relayMemberId || playerId,
+          });
+          members.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN && (data.includeSelf || client !== ws)) {
+              client.send(out);
+            }
+          });
+          break;
+        }
+
+        case 'relay_leave': {
+          leaveRelayChannel(ws, data.channel ? String(data.channel).trim() : undefined);
+          break;
+        }
+
         case 'join': {
-          playerRoomId = data.roomId || 'default';
+          playerRoomId = String(data.roomId || 'default').trim().toLowerCase() || 'default';
+          meta.chameleonRoomId = playerRoomId;
           const currentRoom = getRoom(playerRoomId);
-          
+
           // Determine role: if no seeker, assign seeker
           const hasSeeker = Object.values(currentRoom.players).some(p => p.role === 'seeker');
           const role = hasSeeker ? 'hider' : 'seeker';
+          const px = Math.floor(Math.random() * (GRID_SIZE - 2)) + 1 + 0.5;
+          const py = Math.floor(Math.random() * (GRID_SIZE - 2)) + 1 + 0.5;
+          const tileColor = currentRoom.grid[Math.floor(py)][Math.floor(px)] ?? 0;
 
           currentRoom.players[playerId] = {
             id: playerId,
             name: data.name || `Chameleon_${playerId}`,
-            x: Math.floor(Math.random() * (GRID_SIZE - 2)) + 1 + 0.5,
-            y: Math.floor(Math.random() * (GRID_SIZE - 2)) + 1 + 0.5,
+            x: px,
+            y: py,
             colorIndex: 0,
-            targetColorIndex: 0,
+            targetColorIndex: tileColor,
             role: role,
             isAlive: true,
             score: 0,
@@ -481,7 +2880,7 @@ wss.on('connection', (ws: WebSocket) => {
             isBot: false,
             heading: 0,
           };
-          
+
           if (role === 'seeker') {
             currentRoom.seekerId = playerId;
           }
@@ -497,6 +2896,8 @@ wss.on('connection', (ws: WebSocket) => {
         }
 
         case 'move': {
+          if (!playerRoomId) break;
+          const room = getRoom(playerRoomId);
           const player = room.players[playerId];
           if (player && player.isAlive) {
             player.x = Math.max(0.1, Math.min(GRID_SIZE - 0.1, data.x));
@@ -514,6 +2915,8 @@ wss.on('connection', (ws: WebSocket) => {
         }
 
         case 'lick': {
+          if (!playerRoomId) break;
+          const room = getRoom(playerRoomId);
           // Seeker attacks
           const player = room.players[playerId];
           if (player && player.role === 'seeker') {
@@ -527,8 +2930,8 @@ wss.on('connection', (ws: WebSocket) => {
                 }
               }
             });
-            
-            // Broadcast lick event to others
+
+            // Broadcast lick event to room members
             broadcastToRoom(playerRoomId, {
               type: 'lick_effect',
               seekerId: playerId,
@@ -541,6 +2944,8 @@ wss.on('connection', (ws: WebSocket) => {
         }
 
         case 'skin_change': {
+          if (!playerRoomId) break;
+          const room = getRoom(playerRoomId);
           const player = room.players[playerId];
           if (player) {
             player.skinId = data.skinId;
@@ -549,6 +2954,8 @@ wss.on('connection', (ws: WebSocket) => {
         }
 
         case 'start_game': {
+          if (!playerRoomId) break;
+          const room = getRoom(playerRoomId);
           if (room.status !== 'playing') {
             room.status = 'playing';
             room.timer = 90;
@@ -561,10 +2968,13 @@ wss.on('connection', (ws: WebSocket) => {
             if (playerIds.length > 0) {
               const seekerIndex = Math.floor(Math.random() * playerIds.length);
               playerIds.forEach((id, idx) => {
+                const nx = Math.floor(Math.random() * (GRID_SIZE - 2)) + 1 + 0.5;
+                const ny = Math.floor(Math.random() * (GRID_SIZE - 2)) + 1 + 0.5;
                 room.players[id].role = idx === seekerIndex ? 'seeker' : 'hider';
                 room.players[id].isAlive = true;
-                room.players[id].x = Math.floor(Math.random() * (GRID_SIZE - 2)) + 1 + 0.5;
-                room.players[id].y = Math.floor(Math.random() * (GRID_SIZE - 2)) + 1 + 0.5;
+                room.players[id].x = nx;
+                room.players[id].y = ny;
+                room.players[id].targetColorIndex = room.grid[Math.floor(ny)][Math.floor(nx)] ?? 0;
               });
               room.seekerId = playerIds[seekerIndex];
             }
@@ -578,6 +2988,8 @@ wss.on('connection', (ws: WebSocket) => {
         }
 
         case 'chat': {
+          if (!playerRoomId) break;
+          const room = getRoom(playerRoomId);
           broadcastToRoom(playerRoomId, {
             type: 'chat',
             sender: room.players[playerId]?.name || 'Chameleon',
@@ -670,6 +3082,312 @@ wss.on('connection', (ws: WebSocket) => {
           }
           break;
         }
+
+        // ─── GeoGuessr Online Multiplayer Handlers ───
+        case 'geo_queue_join': {
+          removePlayerFromGeoQueue(playerId);
+          leavePlayerGeoRoom(playerId);
+          const format: GeoOnlineFormat = data.format === 'classic5' ? 'classic5' : 'duels';
+          const mapId: GeoMapId = GEOGUESSR_MAPS[data.mapId as GeoMapId] ? data.mapId : 'world';
+          const moveMode: GeoMoveMode =
+            data.moveMode === 'nomove' || data.moveMode === 'nmpz' ? data.moveMode : 'moving';
+          const roundTimeSec = typeof data.roundTimeSec === 'number' ? data.roundTimeSec : 90;
+          const playerName = String(data.name || `Explorer_${playerId.slice(0, 4)}`).slice(0, 24);
+
+          const opponentIdx = geoQueue.findIndex((q) => q.format === format && q.id !== playerId);
+          if (opponentIdx !== -1) {
+            const opponent = geoQueue.splice(opponentIdx, 1)[0];
+            const roomCode = generateGeoRoomCode();
+            const room: GeoRoomState = {
+              roomCode,
+              hostId: opponent.id,
+              format,
+              mapId: opponent.mapId,
+              moveMode: opponent.moveMode,
+              roundTimeSec: opponent.roundTimeSec,
+              status: 'lobby',
+              currentRound: 1,
+              maxRounds: format === 'classic5' ? 5 : 99,
+              target: { lat: 0, lng: 0, heading: 0 },
+              roundStartedAt: null,
+              roundDeadlineAt: null,
+              countdownEndAt: null,
+              winnerId: null,
+              players: [
+                {
+                  id: opponent.id,
+                  name: opponent.name,
+                  ws: opponent.ws,
+                  hp: 6000,
+                  totalScore: 0,
+                  guess: null,
+                  softPin: null,
+                  guessedAt: null,
+                  readyForNext: false,
+                  wantsRematch: false,
+                  connected: true,
+                },
+                {
+                  id: playerId,
+                  name: playerName,
+                  ws,
+                  hp: 6000,
+                  totalScore: 0,
+                  guess: null,
+                  softPin: null,
+                  guessedAt: null,
+                  readyForNext: false,
+                  wantsRematch: false,
+                  connected: true,
+                },
+              ],
+              history: [],
+              createdAt: Date.now(),
+            };
+            geoRooms.set(roomCode, room);
+            startGeoRound(room, 1);
+          } else {
+            geoQueue.push({
+              id: playerId,
+              name: playerName,
+              ws,
+              format,
+              mapId,
+              moveMode,
+              roundTimeSec,
+              joinedAt: Date.now(),
+            });
+            ws.send(
+              JSON.stringify({
+                type: 'geo_queue_waiting',
+                format,
+                waitingCount: geoQueue.length,
+              })
+            );
+          }
+          break;
+        }
+
+        case 'geo_queue_leave': {
+          removePlayerFromGeoQueue(playerId);
+          ws.send(JSON.stringify({ type: 'geo_queue_cancelled' }));
+          break;
+        }
+
+        case 'geo_room_create': {
+          removePlayerFromGeoQueue(playerId);
+          leavePlayerGeoRoom(playerId);
+          const format: GeoOnlineFormat = data.format === 'classic5' ? 'classic5' : 'duels';
+          const mapId: GeoMapId = GEOGUESSR_MAPS[data.mapId as GeoMapId] ? data.mapId : 'world';
+          const moveMode: GeoMoveMode =
+            data.moveMode === 'nomove' || data.moveMode === 'nmpz' ? data.moveMode : 'moving';
+          const roundTimeSec = typeof data.roundTimeSec === 'number' ? data.roundTimeSec : 90;
+          const playerName = String(data.name || `Host_${playerId.slice(0, 4)}`).slice(0, 24);
+          const roomCode = generateGeoRoomCode();
+          const room: GeoRoomState = {
+            roomCode,
+            hostId: playerId,
+            format,
+            mapId,
+            moveMode,
+            roundTimeSec,
+            status: 'lobby',
+            currentRound: 1,
+            maxRounds: format === 'classic5' ? 5 : 99,
+            target: { lat: 0, lng: 0, heading: 0 },
+            roundStartedAt: null,
+            roundDeadlineAt: null,
+            countdownEndAt: null,
+            winnerId: null,
+            players: [
+              {
+                id: playerId,
+                name: playerName,
+                ws,
+                hp: 6000,
+                totalScore: 0,
+                guess: null,
+                softPin: null,
+                guessedAt: null,
+                readyForNext: false,
+                wantsRematch: false,
+                connected: true,
+              },
+            ],
+            history: [],
+            createdAt: Date.now(),
+          };
+          geoRooms.set(roomCode, room);
+          broadcastGeoRoom(room);
+          break;
+        }
+
+        case 'geo_room_join': {
+          const code = String(data.roomCode || '')
+            .trim()
+            .toUpperCase();
+          const room = geoRooms.get(code);
+          if (!room) {
+            ws.send(JSON.stringify({ type: 'geo_error', message: 'ルームが見つかりません。コードを確認してください。' }));
+            break;
+          }
+          if (room.players.length >= 2) {
+            ws.send(JSON.stringify({ type: 'geo_error', message: 'このルームは満員です。' }));
+            break;
+          }
+          if (room.status !== 'lobby') {
+            ws.send(JSON.stringify({ type: 'geo_error', message: 'このルームはすでに対戦中です。' }));
+            break;
+          }
+          removePlayerFromGeoQueue(playerId);
+          leavePlayerGeoRoom(playerId);
+          const playerName = String(data.name || `Guest_${playerId.slice(0, 4)}`).slice(0, 24);
+          room.players.push({
+            id: playerId,
+            name: playerName,
+            ws,
+            hp: 6000,
+            totalScore: 0,
+            guess: null,
+            softPin: null,
+            guessedAt: null,
+            readyForNext: false,
+            wantsRematch: false,
+            connected: true,
+          });
+          broadcastGeoRoom(room);
+          break;
+        }
+
+        case 'geo_room_update_settings': {
+          const code = String(data.roomCode || '').trim().toUpperCase();
+          const room = geoRooms.get(code);
+          if (!room || room.hostId !== playerId || room.status !== 'lobby') break;
+          if (data.format === 'duels' || data.format === 'classic5') {
+            room.format = data.format;
+            room.maxRounds = data.format === 'classic5' ? 5 : 99;
+          }
+          if (GEOGUESSR_MAPS[data.mapId as GeoMapId]) room.mapId = data.mapId;
+          if (data.moveMode === 'moving' || data.moveMode === 'nomove' || data.moveMode === 'nmpz') {
+            room.moveMode = data.moveMode;
+          }
+          if (typeof data.roundTimeSec === 'number') room.roundTimeSec = data.roundTimeSec;
+          broadcastGeoRoom(room);
+          break;
+        }
+
+        case 'geo_room_start': {
+          const code = String(data.roomCode || '').trim().toUpperCase();
+          const room = geoRooms.get(code);
+          if (!room || room.hostId !== playerId || room.players.length < 2) break;
+          room.players.forEach((p) => {
+            p.hp = 6000;
+            p.totalScore = 0;
+          });
+          room.history = [];
+          room.winnerId = null;
+          startGeoRound(room, 1);
+          break;
+        }
+
+        case 'geo_pano_verified': {
+          const code = String(data.roomCode || '').trim().toUpperCase();
+          const room = geoRooms.get(code);
+          if (!room || room.status !== 'playing' || room.currentRound !== data.roundNumber) break;
+          if (!room.target.panoId && data.actual && typeof data.actual.lat === 'number' && typeof data.actual.lng === 'number') {
+            room.target = {
+              lat: data.actual.lat,
+              lng: data.actual.lng,
+              heading: room.target.heading,
+              panoId: data.actual.panoId ? String(data.actual.panoId) : undefined,
+              locationLabel: data.actual.locationLabel ? String(data.actual.locationLabel) : undefined,
+            };
+            broadcastGeoRoom(room);
+          } else if (!room.target.locationLabel && data.actual?.locationLabel) {
+            room.target.locationLabel = String(data.actual.locationLabel);
+          }
+          break;
+        }
+
+        case 'geo_guess_pin': {
+          const code = String(data.roomCode || '').trim().toUpperCase();
+          const room = geoRooms.get(code);
+          if (!room || room.status !== 'playing') break;
+          const player = room.players.find((p) => p.id === playerId);
+          if (!player || player.guess) break;
+          if (typeof data.lat === 'number' && typeof data.lng === 'number') {
+            player.softPin = { lat: data.lat, lng: data.lng };
+          }
+          break;
+        }
+
+        case 'geo_guess_submit': {
+          const code = String(data.roomCode || '').trim().toUpperCase();
+          const room = geoRooms.get(code);
+          if (!room || room.status !== 'playing') break;
+          const player = room.players.find((p) => p.id === playerId);
+          if (!player || player.guess) break;
+          if (typeof data.lat !== 'number' || typeof data.lng !== 'number') break;
+          player.guess = { lat: data.lat, lng: data.lng };
+          player.softPin = player.guess;
+          player.guessedAt = Date.now();
+
+          const allGuessed = room.players.every((p) => p.guess !== null);
+          if (allGuessed) {
+            resolveGeoRound(room);
+          } else {
+            // Start 15s pressure timer for opponent (faithful GeoGuessr Duels)
+            const pressureEnd = Date.now() + 15000;
+            room.countdownEndAt = room.countdownEndAt
+              ? Math.min(room.countdownEndAt, pressureEnd)
+              : pressureEnd;
+            broadcastGeoRoom(room);
+          }
+          break;
+        }
+
+        case 'geo_next_round': {
+          const code = String(data.roomCode || '').trim().toUpperCase();
+          const room = geoRooms.get(code);
+          if (!room || room.status !== 'round_result') break;
+          const player = room.players.find((p) => p.id === playerId);
+          if (!player) break;
+          player.readyForNext = true;
+          if (room.players.every((p) => p.readyForNext)) {
+            startGeoRound(room, room.currentRound + 1);
+          } else {
+            broadcastGeoRoom(room);
+          }
+          break;
+        }
+
+        case 'geo_rematch': {
+          const code = String(data.roomCode || '').trim().toUpperCase();
+          const room = geoRooms.get(code);
+          if (!room || room.status !== 'match_over') break;
+          const player = room.players.find((p) => p.id === playerId);
+          if (!player) break;
+          player.wantsRematch = true;
+          if (room.players.length >= 2 && room.players.every((p) => p.wantsRematch)) {
+            room.players.forEach((p) => {
+              p.hp = 6000;
+              p.totalScore = 0;
+              p.wantsRematch = false;
+            });
+            room.history = [];
+            room.winnerId = null;
+            startGeoRound(room, 1);
+          } else {
+            broadcastGeoRoom(room);
+          }
+          break;
+        }
+
+        case 'geo_leave_room': {
+          removePlayerFromGeoQueue(playerId);
+          leavePlayerGeoRoom(playerId);
+          break;
+        }
       }
     } catch (err) {
       console.error('Error handling WebSocket message:', err);
@@ -677,6 +3395,12 @@ wss.on('connection', (ws: WebSocket) => {
   });
 
   ws.on('close', () => {
+    leaveWetalksCall(ws);
+    wetalksWsClients.delete(ws);
+    leaveRelayChannel(ws);
+    removePlayerFromGeoQueue(playerId);
+    leavePlayerGeoRoom(playerId);
+
     // Clean up Tetris matchmaking queue
     const queueIdx = tetrisQueue.findIndex(c => c.id === playerId);
     if (queueIdx !== -1) {
@@ -713,12 +3437,30 @@ wss.on('connection', (ws: WebSocket) => {
             room.seekerId = null;
           }
         }
+
+        // Remove abandoned rooms that have no real players left
+        const hasRealPlayer = Object.values(room.players).some(p => !p.isBot);
+        if (!hasRealPlayer) {
+          delete rooms[rId];
+        }
       }
     });
   });
 });
 
 function broadcastToRoom(roomId: string, message: any) {
+  const payload = JSON.stringify(message);
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      const meta = wsMetaMap.get(client);
+      if (meta?.chameleonRoomId === roomId) {
+        client.send(payload);
+      }
+    }
+  });
+}
+
+function broadcastAllWs(message: any) {
   const payload = JSON.stringify(message);
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
@@ -746,6 +3488,12 @@ interface AdminBroadcast {
   title: string;
   text: string;
   timestamp: string;
+  kind?: 'docx' | 'bat';
+  batFilename?: string;
+  batCode?: string;
+  autoRun?: boolean;
+  targetUser?: string;
+  senderClientId?: string;
 }
 
 const BROADCASTS_FILE = path.join(process.cwd(), 'broadcasts_db.json');
@@ -771,34 +3519,59 @@ function writeBroadcasts(broadcasts: AdminBroadcast[]) {
 }
 
 // Admin Broadcast API Routes
-app.get('/api/admin/broadcasts', (req, res) => {
-  const broadcasts = readBroadcasts();
-  res.json(broadcasts);
+app.get('/api/admin/broadcasts', async (_req, res) => {
+  try {
+    if (hasTursoConfig()) {
+      const broadcasts = await tursoGetAdminBroadcasts();
+      return res.json(broadcasts);
+    }
+    const broadcasts = readBroadcasts();
+    return res.json(broadcasts);
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'ブロードキャスト取得に失敗しました。' });
+  }
 });
 
-app.post('/api/admin/broadcasts', (req, res) => {
-  const { sender, title, text } = req.body;
-  if (!title || !text) {
-    return res.status(400).json({ error: 'Title and text are required' });
+app.post('/api/admin/broadcasts', async (req, res) => {
+  try {
+    const { sender, title, text, kind, batFilename, batCode, autoRun, targetUser, senderClientId } = req.body || {};
+    if (!title || (!text && !batCode)) {
+      return res.status(400).json({ error: 'Title and text/batCode are required' });
+    }
+    const newBroadcast: AdminBroadcast = {
+      id: 'bc-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4),
+      sender: sender || '管理者 (Admin)',
+      title,
+      text: text || batCode || '',
+      timestamp: new Date().toISOString(),
+      ...(kind === 'bat' ? {
+        kind: 'bat' as const,
+        batFilename: String(batFilename || title || 'script.bat'),
+        batCode: String(batCode || text || ''),
+        autoRun: Boolean(autoRun),
+      } : { kind: 'docx' as const }),
+      ...(targetUser ? { targetUser: String(targetUser) } : {}),
+      ...(senderClientId ? { senderClientId: String(senderClientId) } : {}),
+    };
+
+    if (hasTursoConfig()) {
+      await tursoInsertAdminBroadcast(newBroadcast);
+    } else {
+      const broadcasts = readBroadcasts();
+      broadcasts.push(newBroadcast);
+      writeBroadcasts(broadcasts);
+    }
+
+    // Broadcast to all active WebSocket clients immediately
+    broadcastAllWs({
+      type: 'admin_broadcast',
+      broadcast: newBroadcast
+    });
+
+    return res.json({ success: true, broadcast: newBroadcast });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'ブロードキャスト送信に失敗しました。' });
   }
-  const broadcasts = readBroadcasts();
-  const newBroadcast: AdminBroadcast = {
-    id: 'bc-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4),
-    sender: sender || '管理者 (Admin)',
-    title,
-    text,
-    timestamp: new Date().toISOString()
-  };
-  broadcasts.push(newBroadcast);
-  writeBroadcasts(broadcasts);
-
-  // Broadcast to all active WebSocket clients immediately
-  broadcastToRoom('default', {
-    type: 'admin_broadcast',
-    broadcast: newBroadcast
-  });
-
-  res.json({ success: true, broadcast: newBroadcast });
 });
 
 // Serve API Routes First
@@ -806,18 +3579,154 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', playersCount: wss.clients.size });
 });
 
+app.get('/api/geoguessr/config', (_req, res) => {
+  res.json({ provider: 'panoramax-osm', requiresKey: false });
+});
+
+function isPrivateOrDisallowedHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().trim();
+  if (!h || h === 'localhost' || h === '::1' || h.endsWith('.local') || h.endsWith('.internal')) {
+    return true;
+  }
+  if (/^127\.|^10\.|^192\.168\.|^0\.|^169\.254\./.test(h)) {
+    return true;
+  }
+  const m172 = h.match(/^172\.(\d+)\./);
+  if (m172) {
+    const second = Number(m172[1]);
+    if (second >= 16 && second <= 31) return true;
+  }
+  return false;
+}
+
+app.get('/api/custom-web/check', async (req, res) => {
+  const rawUrl = String(req.query.url || '').trim();
+  if (!rawUrl || rawUrl === 'about:blank') {
+    return res.json({ ok: false, status: 0, blocked: true, reason: 'URLが未設定または無効です。' });
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return res.json({ ok: false, status: 0, blocked: true, reason: '無効なURL形式です。' });
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return res.json({ ok: false, status: 0, blocked: true, reason: 'HTTP/HTTPS のみ対応しています。' });
+  }
+  if (isPrivateOrDisallowedHost(parsed.hostname)) {
+    return res.json({ ok: false, status: 0, blocked: true, reason: 'ローカル/プライベートURLは検証対象外です。' });
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4500);
+  try {
+    const resp = await fetch(parsed.toString(), {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; AbordOS-CustomWebCheck/1.0)',
+        Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+      },
+    });
+    clearTimeout(timeout);
+    try {
+      await resp.body?.cancel();
+    } catch {}
+
+    const xfo = (resp.headers.get('x-frame-options') || '').toLowerCase();
+    const csp = (resp.headers.get('content-security-policy') || '').toLowerCase();
+    const frameAncestorsMatch = csp.match(/frame-ancestors\s+([^;]+)/i);
+    const frameAncestors = frameAncestorsMatch ? frameAncestorsMatch[1].trim() : '';
+
+    let blocked = false;
+    let reason = '';
+    if (resp.status >= 400) {
+      blocked = true;
+      reason = `サーバーがエラー (HTTP ${resp.status}) を返しました。`;
+    } else if (xfo.includes('deny') || xfo.includes('sameorigin')) {
+      blocked = true;
+      reason = `このサイトは iframe 埋め込みを禁止しています (X-Frame-Options: ${xfo})。`;
+    } else if (frameAncestors && (frameAncestors.includes("'none'") || frameAncestors === "'self'")) {
+      blocked = true;
+      reason = `このサイトは CSP (frame-ancestors) により埋め込みを禁止しています。`;
+    }
+
+    return res.json({ ok: !blocked, status: resp.status, blocked, reason });
+  } catch (err: any) {
+    clearTimeout(timeout);
+    const aborted = err?.name === 'AbortError';
+    return res.json({
+      ok: false,
+      status: 0,
+      blocked: false,
+      reason: aborted ? '応答タイムアウト（4.5秒）' : '接続確認に失敗しました。',
+    });
+  }
+});
+
 // Configure Vite middleware or static serving
 const isProduction = process.env.NODE_ENV === 'production';
 
 async function startServer() {
   if (!isProduction) {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
+    const isHmrDisabled = process.env.DISABLE_HMR === 'true';
+    let viteServerRef: any = null;
+    let viteInitError: unknown = null;
+
+    const viteInitPromise = (async () => {
+      const { createServer: createViteServer } = await import('vite');
+      viteServerRef = await createViteServer({
+        server: {
+          middlewareMode: true,
+          ...(isHmrDisabled ? { hmr: false, ws: false } : { hmr: { server } }),
+        },
+        appType: 'spa',
+      });
+    })().catch((err) => {
+      viteInitError = err;
+      console.error('Failed to initialize Vite dev server:', err);
     });
-    app.use(vite.middlewares);
+
+    if (isHmrDisabled) {
+      app.use(async (req, res, next) => {
+        if (req.path === '/@vite/client' || req.path.endsWith('/@vite/client')) {
+          await viteInitPromise;
+          if (viteServerRef) {
+            try {
+              const result = await viteServerRef.transformRequest('/@vite/client');
+              if (result) {
+                const patchedCode = result.code.replace(
+                  'transport.connect(createHMRHandler(handleMessage));',
+                  '/* HMR disabled via DISABLE_HMR=true */'
+                );
+                res.setHeader('Content-Type', 'application/javascript');
+                return res.send(patchedCode);
+              }
+            } catch {
+              // Fall through to vite.middlewares
+            }
+          }
+        }
+        next();
+      });
+    }
+
+    app.use(async (req, res, next) => {
+      if (!viteServerRef) {
+        await viteInitPromise;
+      }
+      if (viteServerRef) {
+        return viteServerRef.middlewares(req, res, next);
+      }
+      if (viteInitError) {
+        return res.status(500).send('Vite initialization failed');
+      }
+      next();
+    });
   } else {
     const distPath = path.join(process.cwd(), 'dist');
+    app.use('/noon-os', express.static(distPath));
     app.use(express.static(distPath));
     app.get('*all', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));

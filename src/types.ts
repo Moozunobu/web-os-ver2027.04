@@ -20,7 +20,11 @@ export type AppID =
   | 'chameleon'
   | 'noobstore'
   | 'sprout'
+  | 'vscode'
   | 'aboad'
+  | 'racing'
+  | 'floppybird'
+  | 'geoguessr'
   | string;
 
 export interface VirtualDesktop {
@@ -85,6 +89,7 @@ export interface SettingsState {
   showDesktopClockWidget?: boolean; // Show clock & calendar widget on Desktop
   showDesktopNotesWidget?: boolean; // Show sticky notes widget on Desktop
   desktopWidgetPositions?: Record<string, { x: number; y: number }>; // Saved desktop coordinates for widgets
+  fullscreenImage?: string; // Image for fullscreen display when C key is pressed
 }
 
 export interface DesktopIconDef {

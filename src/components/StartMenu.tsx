@@ -7,6 +7,7 @@ import {
   StickyNote, GripVertical, RotateCcw
 } from 'lucide-react';
 import { AppIcon } from './AppIcon';
+import { resolveCustomAppIconId } from './CustomAppIcons';
 import { AnalogClock } from './AnalogClock';
 import { AppID } from '../types';
 import { SYSTEM_STORE_APPS, getInstalledSystemAppIds } from '../data/storeApps';
@@ -44,12 +45,15 @@ const DEFAULT_TILE_ORDER = [
   'files',
   'settings',
   'notepad',
+  'vscode',
   'excel',
   'wetalks',
   'terminal',
   'paint',
   'word',
   'minecraft',
+  'racing',
+  'geoguessr',
 ];
 
 export const StartMenu: React.FC<StartMenuProps> = ({
@@ -74,7 +78,7 @@ export const StartMenu: React.FC<StartMenuProps> = ({
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [installedSystemApps, setInstalledSystemApps] = useState<string[]>([]);
-  const [customWebApps, setCustomWebApps] = useState<Array<{ id: string; title: string; iconChar?: string }>>([]);
+  const [customWebApps, setCustomWebApps] = useState<Array<{ id: string; title: string; url?: string; iconChar?: string; iconId?: string }>>([]);
   const [isSidebarExpanded, setIsSidebarExpanded] = useState(false);
   const [isPowerMenuOpen, setIsPowerMenuOpen] = useState(false);
 
@@ -221,7 +225,7 @@ export const StartMenu: React.FC<StartMenuProps> = ({
   const installedCustomApps = customWebApps.map((app) => ({
     id: app.id as AppID,
     title: app.title,
-    icon: 'browser',
+    icon: resolveCustomAppIconId(app),
     desc: 'Custom Web Application',
   }));
 
@@ -1009,6 +1013,31 @@ export const StartMenu: React.FC<StartMenuProps> = ({
                             <GripVertical className="w-3.5 h-3.5 text-white/40 opacity-0 group-hover:opacity-100 transition-opacity cursor-grab" />
                           </div>
                           <p className="text-[11px] font-bold text-white truncate">Terminal</p>
+                        </div>
+                      );
+                    }
+
+                    // VS Code Tile
+                    if (tileId === 'vscode') {
+                      return (
+                        <div
+                          key="vscode"
+                          draggable
+                          onDragStart={(e) => handleDragStart(e, idx)}
+                          onDragOver={(e) => handleDragOver(e, idx)}
+                          onDrop={(e) => handleDrop(e, idx)}
+                          onDragEnd={() => { setDraggedIndex(null); setDragOverIndex(null); }}
+                          onClick={() => handleAppClick('vscode')}
+                          className={`h-20 bg-[#1e293b] hover:bg-[#0f172a] p-2.5 rounded-lg cursor-pointer transition-all hover:scale-[1.01] active:scale-95 shadow-md flex flex-col justify-between group border ${
+                            isDragOver ? 'ring-2 ring-sky-400 border-white' : 'border-sky-500/30'
+                          } ${isDragged ? 'opacity-30' : 'opacity-100'}`}
+                          id="tile-vscode"
+                        >
+                          <div className="flex items-center justify-between">
+                            <AppIcon id="vscode" size={22} />
+                            <GripVertical className="w-3.5 h-3.5 text-white/40 opacity-0 group-hover:opacity-100 transition-opacity cursor-grab" />
+                          </div>
+                          <p className="text-[11px] font-bold text-white truncate">VS Code</p>
                         </div>
                       );
                     }

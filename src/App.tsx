@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { AppID, WindowInstance, SettingsState, WALLPAPERS, VirtualFile, DesktopItem, VirtualDesktop } from './types';
 import { Window } from './components/Window';
 import { Taskbar } from './components/Taskbar';
@@ -13,6 +13,7 @@ import { DesktopWidgets } from './components/DesktopWidgets';
 import { FolderViewWindow } from './components/FolderViewWindow';
 import { TaskViewModal } from './components/TaskViewModal';
 import { findAvailableGridSpot, resolveOverlappingItems } from './utils/grid';
+import { buildApiUrl, resolveWeTalksApiBaseUrl, resolveWsBaseUrl } from './config/backend';
 import { FolderPlus, Grid, Settings as SettingsIcon, CloudSun, Clock as ClockIcon, StickyNote as StickyNoteIcon } from 'lucide-react';
 
 // App Components
@@ -37,11 +38,19 @@ import FlightSimulatorApp from './components/apps/FlightSimulatorApp';
 import { ChameleonGameApp } from './components/apps/ChameleonGameApp';
 import { NoobStoreApp } from './components/apps/NoobStoreApp';
 import { SproutApp } from './components/apps/SproutApp';
+import { VSCodeApp } from './components/apps/VSCodeApp';
 import { AboadApp } from './components/apps/AboadApp';
+import { RacingGameApp } from './components/apps/RacingGameApp';
+import { FloppyBirdApp } from './components/apps/FloppyBirdApp';
+import { GeoGuessrApp } from './components/apps/GeoGuessrApp';
+import { WebGameFrameApp } from './components/apps/WebGameFrameApp';
+import { resolveCustomAppIconId } from './components/CustomAppIcons';
+import { normalizeCustomWebUrl } from './utils/customWebUrl';
 import { CHAT_APP_HTML } from './components/browserConstants';
 import { BootScreen } from './components/BootScreen';
 import { LockScreen } from './components/LockScreen';
 import { OOBESetup } from './components/OOBESetup';
+import { FullscreenBossOverlay } from './components/FullscreenBossOverlay';
 import { motion, AnimatePresence } from 'motion/react';
 
 const getLocalizedAppTitle = (appId: AppID | string, language: 'ja' | 'en' = 'ja', defaultTitle?: string): string => {
@@ -68,7 +77,11 @@ const getLocalizedAppTitle = (appId: AppID | string, language: 'ja' | 'en' = 'ja
     case 'noobstore': return isJa ? 'Abord Store' : 'Abord Store';
     case 'tetris': return isJa ? 'ネオ テトリス' : 'Neo Tetris';
     case 'sprout': return isJa ? 'Sprout Studio (開発環境)' : 'Sprout Studio (IDE)';
+    case 'vscode': return 'VS Code';
     case 'aboad': return 'Aboad';
+    case 'racing': return isJa ? 'レーシングカーゲーム' : 'Racing Car Game';
+    case 'floppybird': return 'Floppy Bird';
+    case 'geoguessr': return 'GeoGuessr';
     default: return defaultTitle || appId;
   }
 };
@@ -502,6 +515,82 @@ export default function App() {
         minWidth: 500,
         minHeight: 400,
       },
+      {
+        id: 'vscode',
+        title: 'VS Code',
+        icon: 'vscode',
+        isOpen: false,
+        isMinimized: false,
+        isMaximized: false,
+        x: 65,
+        y: 35,
+        width: 1100,
+        height: 690,
+        prevX: 0,
+        prevY: 0,
+        prevWidth: 0,
+        prevHeight: 0,
+        zIndex: 10,
+        minWidth: 640,
+        minHeight: 460,
+      },
+      {
+        id: 'racing',
+        title: 'Racing Car Game',
+        icon: 'racing',
+        isOpen: false,
+        isMinimized: false,
+        isMaximized: false,
+        x: 90,
+        y: 45,
+        width: 960,
+        height: 620,
+        prevX: 0,
+        prevY: 0,
+        prevWidth: 0,
+        prevHeight: 0,
+        zIndex: 10,
+        minWidth: 520,
+        minHeight: 400,
+      },
+      {
+        id: 'floppybird',
+        title: 'Floppy Bird',
+        icon: 'floppybird',
+        isOpen: false,
+        isMinimized: false,
+        isMaximized: false,
+        x: 180,
+        y: 50,
+        width: 520,
+        height: 640,
+        prevX: 0,
+        prevY: 0,
+        prevWidth: 0,
+        prevHeight: 0,
+        zIndex: 10,
+        minWidth: 380,
+        minHeight: 480,
+      },
+      {
+        id: 'geoguessr',
+        title: 'GeoGuessr',
+        icon: 'geoguessr',
+        isOpen: false,
+        isMinimized: false,
+        isMaximized: false,
+        x: 70,
+        y: 35,
+        width: 1040,
+        height: 680,
+        prevX: 0,
+        prevY: 0,
+        prevWidth: 0,
+        prevHeight: 0,
+        zIndex: 10,
+        minWidth: 640,
+        minHeight: 460,
+      },
     ];
   };
 
@@ -524,7 +613,9 @@ export default function App() {
     'nmap',
     'terminal',
     'excel',
-    'aboad'
+    'aboad',
+    'floppybird',
+    'geoguessr'
   ]);
 
   const [openWindows, setOpenWindows] = useState<WindowInstance[]>(getInitialWindows);
@@ -638,6 +729,18 @@ export default function App() {
   const [activeWindowId, setActiveWindowId] = useState<AppID | null>(null);
   const [isStartOpen, setIsStartOpen] = useState(false);
 
+  const openWindowsRef = useRef(openWindows);
+  const activeWindowIdRef = useRef(activeWindowId);
+  const wetalksIframeRef = useRef<HTMLIFrameElement>(null);
+
+  useEffect(() => {
+    openWindowsRef.current = openWindows;
+  }, [openWindows]);
+
+  useEffect(() => {
+    activeWindowIdRef.current = activeWindowId;
+  }, [activeWindowId]);
+
   // Desktop Items (with Drag & Drop, deletion, recycle bin status)
   const getDefaultDesktopItems = (): DesktopItem[] => {
     return [
@@ -666,6 +769,49 @@ export default function App() {
           if (sysSaved) installedSysApps = JSON.parse(sysSaved);
         } catch (e) {}
 
+        // One-time seed so the newly requested Racing Car Game app is immediately available on Desktop, Start Menu & Store
+        const isRacingSeeded = localStorage.getItem('webos_seeded_racing_v1') === '1';
+        if (!isRacingSeeded) {
+          if (!installedSysApps.includes('racing')) {
+            installedSysApps = [...installedSysApps, 'racing'];
+            localStorage.setItem('webos_installed_system_apps', JSON.stringify(installedSysApps));
+            window.dispatchEvent(new Event('webos_installed_apps_changed'));
+          }
+          localStorage.setItem('webos_seeded_racing_v1', '1');
+        }
+
+        // One-time seed so GeoGuessr is immediately available on Desktop, Start Menu & Store
+        const isGeoSeeded = localStorage.getItem('webos_seeded_geoguessr_v1') === '1';
+        if (!isGeoSeeded) {
+          if (!installedSysApps.includes('geoguessr')) {
+            installedSysApps = [...installedSysApps, 'geoguessr'];
+            localStorage.setItem('webos_installed_system_apps', JSON.stringify(installedSysApps));
+            window.dispatchEvent(new Event('webos_installed_apps_changed'));
+          }
+          localStorage.setItem('webos_seeded_geoguessr_v1', '1');
+        }
+
+        // One-time seed so VS Code is immediately available on Desktop, Start Menu & Store
+        const isVSCodeSeeded = localStorage.getItem('webos_seeded_vscode_v1') === '1';
+        if (!isVSCodeSeeded) {
+          if (!installedSysApps.includes('vscode')) {
+            installedSysApps = [...installedSysApps, 'vscode'];
+            localStorage.setItem('webos_installed_system_apps', JSON.stringify(installedSysApps));
+            window.dispatchEvent(new Event('webos_installed_apps_changed'));
+          }
+          localStorage.setItem('webos_seeded_vscode_v1', '1');
+        }
+
+        // Clean up removed Battle Royale app from existing browser caches
+        try {
+          localStorage.removeItem('webos_seeded_battleroyale_v1');
+        } catch (e) {}
+        if (installedSysApps.includes('battleroyale')) {
+          installedSysApps = installedSysApps.filter((id) => id !== 'battleroyale');
+          localStorage.setItem('webos_installed_system_apps', JSON.stringify(installedSysApps));
+          window.dispatchEvent(new Event('webos_installed_apps_changed'));
+        }
+
         const stored = localStorage.getItem('webos_desktop_items_v2');
         if (stored) {
           let parsed = JSON.parse(stored) as DesktopItem[];
@@ -674,6 +820,7 @@ export default function App() {
           const originalLen = parsed.length;
           parsed = parsed.filter((item) => {
             const appId = item.appId || item.id;
+            if (appId === 'battleroyale' || item.id === 'battleroyale' || item.icon === 'battleroyale') return false;
             if (HIDDEN_APP_IDS.has(appId) && !installedSysApps.includes(appId)) return false;
             if (item.id === 'welcome-shortcut' || item.fileName === 'welcome.txt') return false;
             return true;
@@ -688,6 +835,9 @@ export default function App() {
           const hasSettings = parsed.some((item) => item.id === 'settings');
           const hasFiles = parsed.some((item) => item.id === 'files');
           const hasStore = parsed.some((item) => item.id === 'noobstore' || item.appId === 'noobstore');
+          const hasRacing = parsed.some((item) => item.id === 'racing' || item.appId === 'racing');
+          const hasGeo = parsed.some((item) => item.id === 'geoguessr' || item.appId === 'geoguessr');
+          const hasVSCode = parsed.some((item) => item.id === 'vscode' || item.appId === 'vscode');
 
           if (!hasRecycle) {
             parsed.push({ id: 'recycle', appId: 'recycle', title: 'Recycle Bin', icon: 'recycle', type: 'recycle', x: 24, y: 24 });
@@ -705,11 +855,65 @@ export default function App() {
             parsed.push({ id: 'noobstore', appId: 'noobstore', title: 'Aboard Store', icon: 'noobstore', type: 'app', x: 24, y: 324 });
             changed = true;
           }
+          if (!isRacingSeeded && !hasRacing) {
+            const racingSpot = findAvailableGridSpot(parsed);
+            parsed.push({ id: 'racing', appId: 'racing', title: 'レーシングカーゲーム (LibreCorsa)', icon: 'racing', type: 'app', x: racingSpot.x, y: racingSpot.y });
+            changed = true;
+          }
+          if (!isGeoSeeded && !hasGeo) {
+            const geoSpot = findAvailableGridSpot(parsed);
+            parsed.push({ id: 'geoguessr', appId: 'geoguessr', title: 'GeoGuessr', icon: 'geoguessr', type: 'app', x: geoSpot.x, y: geoSpot.y });
+            changed = true;
+          }
+          if (!isVSCodeSeeded && !hasVSCode) {
+            const vscodeSpot = findAvailableGridSpot(parsed);
+            parsed.push({ id: 'vscode', appId: 'vscode', title: 'VS Code', icon: 'vscode', type: 'app', x: vscodeSpot.x, y: vscodeSpot.y });
+            changed = true;
+          }
+
+          let customInstalled: Array<{ id: string; url?: string; iconChar?: string; iconId?: string }> = [];
+          try {
+            const customRaw = localStorage.getItem('noobstore_installed_apps');
+            if (customRaw) {
+              const parsedCustom = JSON.parse(customRaw) as Array<{ id: string; url?: string; iconChar?: string; iconId?: string }>;
+              let customMigrated = false;
+              const filteredCustom = parsedCustom.filter((c) => {
+                if (c.id === 'battleroyale' || c.id === 'curated-battleroyale' || (c.url && c.url.includes('wildfire-ops.internal'))) {
+                  customMigrated = true;
+                  return false;
+                }
+                return true;
+              });
+              customInstalled = filteredCustom.map((c) => {
+                if (c.url) {
+                  const norm = normalizeCustomWebUrl(c.url);
+                  if (norm && norm !== c.url) {
+                    customMigrated = true;
+                    return { ...c, url: norm };
+                  }
+                }
+                return c;
+              });
+              if (customMigrated) {
+                localStorage.setItem('noobstore_installed_apps', JSON.stringify(customInstalled));
+              }
+            }
+          } catch (e) {}
 
           parsed = parsed.map((item) => {
             if (item.id === 'recycle') return { ...item, x: 24, y: 24 };
             if (item.id === 'settings') return { ...item, x: 24, y: 124 };
             if (item.id === 'files') return { ...item, x: 24, y: 224 };
+            if ((item.appId || item.id).startsWith('custom-app-')) {
+              const matched = customInstalled.find((c) => c.id === (item.appId || item.id));
+              if (matched) {
+                const resolvedIcon = resolveCustomAppIconId(matched);
+                if (item.icon !== resolvedIcon) {
+                  changed = true;
+                  return { ...item, icon: resolvedIcon };
+                }
+              }
+            }
             return item;
           });
 
@@ -725,6 +929,12 @@ export default function App() {
           setDesktopItems(parsed);
         } else {
           const defaults = getDefaultDesktopItems();
+          const racingSpot = findAvailableGridSpot(defaults);
+          defaults.push({ id: 'racing', appId: 'racing', title: 'レーシングカーゲーム (LibreCorsa)', icon: 'racing', type: 'app', x: racingSpot.x, y: racingSpot.y });
+          const geoSpot = findAvailableGridSpot(defaults);
+          defaults.push({ id: 'geoguessr', appId: 'geoguessr', title: 'GeoGuessr', icon: 'geoguessr', type: 'app', x: geoSpot.x, y: geoSpot.y });
+          const vscodeSpot = findAvailableGridSpot(defaults);
+          defaults.push({ id: 'vscode', appId: 'vscode', title: 'VS Code', icon: 'vscode', type: 'app', x: vscodeSpot.x, y: vscodeSpot.y });
           localStorage.setItem('webos_desktop_items_v2', JSON.stringify(defaults));
           setDesktopItems(defaults);
         }
@@ -736,7 +946,7 @@ export default function App() {
     const handleLaunchCustom = (e: Event) => {
       const customEvent = e as CustomEvent;
       if (customEvent.detail && customEvent.detail.appId) {
-        handleLaunchApp(customEvent.detail.appId);
+        handleLaunchAppRef.current(customEvent.detail.appId);
       }
     };
 
@@ -920,6 +1130,7 @@ export default function App() {
           showDesktopClockWidget: parsed.showDesktopClockWidget ?? false,
           showDesktopNotesWidget: parsed.showDesktopNotesWidget ?? false,
           desktopWidgetPositions: parsed.desktopWidgetPositions,
+          fullscreenImage: parsed.fullscreenImage,
         };
       }
       // Migrate legacy keys if present
@@ -1033,6 +1244,8 @@ export default function App() {
     appToLaunch?: string;
     payloadContent?: string;
     payloadTitle?: string;
+    roomId?: string;
+    roomName?: string;
   }
 
   const [notifications, setNotifications] = useState<WebOSNotification[]>([]);
@@ -1040,13 +1253,21 @@ export default function App() {
   const [isActionCenterOpen, setIsActionCenterOpen] = useState(false);
   const [isTaskbarHidden, setIsTaskbarHidden] = useState(false);
 
+  const notifAudioCtxRef = useRef<AudioContext | null>(null);
+
   const playNotificationSound = () => {
     try {
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
       if (!AudioContextClass) return;
-      const ctx = new AudioContextClass();
+      if (!notifAudioCtxRef.current || notifAudioCtxRef.current.state === 'closed') {
+        notifAudioCtxRef.current = new AudioContextClass();
+      }
+      const ctx = notifAudioCtxRef.current;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
       const now = ctx.currentTime;
-      
+
       const playNote = (freq: number, start: number, duration: number) => {
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
@@ -1060,7 +1281,7 @@ export default function App() {
         osc.start(start);
         osc.stop(start + duration);
       };
-      
+
       playNote(783.99, now, 0.4); // G5
       playNote(1046.50, now + 0.08, 0.6); // C6
     } catch (e) {
@@ -1085,13 +1306,30 @@ export default function App() {
     setNotificationHistory([]);
   };
 
-  const triggerWebOSNotification = (sender: string, text: string) => {
+  const recentNotifMsgIdsRef = useRef<Set<string>>(new Set());
+
+  const triggerWebOSNotification = (
+    sender: string,
+    text: string,
+    meta?: { id?: string; roomId?: string; roomName?: string }
+  ) => {
+    if (meta?.id) {
+      if (recentNotifMsgIdsRef.current.has(meta.id)) return;
+      recentNotifMsgIdsRef.current.add(meta.id);
+      if (recentNotifMsgIdsRef.current.size > 400) {
+        const first = recentNotifMsgIdsRef.current.values().next().value;
+        if (first) recentNotifMsgIdsRef.current.delete(first);
+      }
+    }
+
     const id = Math.random().toString(36).substring(2, 9);
     const newNotif: WebOSNotification = {
       id,
       sender,
       text,
       timestamp: new Date(),
+      roomId: meta?.roomId,
+      roomName: meta?.roomName,
     };
     
     setNotifications((prev) => [...prev, newNotif]);
@@ -1117,6 +1355,7 @@ export default function App() {
             tagName === 'input' ||
             tagName === 'textarea' ||
             tagName === 'select' ||
+            tagName === 'iframe' ||
             isContentEditable
           ) {
             return;
@@ -1129,20 +1368,403 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [settings.isToggleTaskbarWithQ]);
 
+  // ─── C-Key Panic / Fullscreen Boss Overlay (画像全画面 or 関数グラフ電卓) ───
+  const [isBossOverlayOpen, setIsBossOverlayOpen] = useState(false);
+
+  useEffect(() => {
+    const handleCKeyDown = (e: KeyboardEvent) => {
+      // Toggle overlay on 'c' or 'C'
+      if (e.key === 'c' || e.key === 'C') {
+        const activeEl = document.activeElement;
+        if (activeEl) {
+          const tagName = activeEl.tagName.toLowerCase();
+          const isContentEditable = activeEl.getAttribute('contenteditable') === 'true';
+          // Don't trigger if user is actively writing in a form/text field or focused inside a web app iframe
+          if (
+            tagName === 'input' ||
+            tagName === 'textarea' ||
+            tagName === 'select' ||
+            tagName === 'iframe' ||
+            isContentEditable
+          ) {
+            return;
+          }
+        }
+        e.preventDefault();
+        setIsBossOverlayOpen((prev) => !prev);
+      }
+    };
+
+    const handleCustomTrigger = () => {
+      setIsBossOverlayOpen(true);
+    };
+
+    window.addEventListener('keydown', handleCKeyDown);
+    window.addEventListener('webos_toggle_fullscreen_panic', handleCustomTrigger);
+    return () => {
+      window.removeEventListener('keydown', handleCKeyDown);
+      window.removeEventListener('webos_toggle_fullscreen_panic', handleCustomTrigger);
+    };
+  }, []);
+
   useEffect(() => {
     const handleIframeMessage = (e: MessageEvent) => {
-      if (e.data && e.data.type === 'WETALKS_NEW_MESSAGE') {
-        triggerWebOSNotification(e.data.payload.sender, e.data.payload.text);
+      if (e.data && e.data.type === 'WETALKS_NEW_MESSAGE' && e.data.payload) {
+        const { id, sender, text, roomId, roomName } = e.data.payload;
+        const wetalksWin = openWindowsRef.current.find((w) => w.id === 'wetalks');
+        const isViewingSameRoom =
+          Boolean(wetalksWin && wetalksWin.isOpen && !wetalksWin.isMinimized) &&
+          activeWindowIdRef.current === 'wetalks' &&
+          Boolean(roomId) &&
+          localStorage.getItem('wetalks_active_viewing_room') === String(roomId);
+        if (isViewingSameRoom) return;
+        triggerWebOSNotification(sender, text, { id, roomId, roomName });
       }
     };
     window.addEventListener('message', handleIframeMessage);
     return () => window.removeEventListener('message', handleIframeMessage);
-  }, [settings.isToggleTaskbarWithQ]);
+  }, []);
+
+  // Notify WeTalks iframe when its OS window is active & unminimized so read receipts only fire when visible
+  useEffect(() => {
+    const wetalksWin = openWindows.find((w) => w.id === 'wetalks');
+    const isWeTalksActive =
+      Boolean(wetalksWin && wetalksWin.isOpen && !wetalksWin.isMinimized) &&
+      activeWindowId === 'wetalks';
+    try {
+      wetalksIframeRef.current?.contentWindow?.postMessage(
+        { type: 'WETALKS_WINDOW_ACTIVE', active: isWeTalksActive },
+        '*'
+      );
+    } catch {}
+  }, [openWindows, activeWindowId]);
+
+  // Background WeTalks desktop notification service: instant WS push + fast parallel summary polling
+  useEffect(() => {
+    const NOTIFIED_IDS_KEY = 'wetalks_notified_msg_ids_v1';
+    const seededRooms = new Set<string>();
+    let lastUser = '';
+    let isPolling = false;
+    let disposed = false;
+    let ws: WebSocket | null = null;
+    let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let subscribedUser = '';
+
+    const getNotifiedSet = (): Set<string> => {
+      try {
+        const raw = localStorage.getItem(NOTIFIED_IDS_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) return new Set(parsed.map(String));
+        }
+      } catch {}
+      return new Set();
+    };
+
+    const addNotifiedIds = (ids: string[]) => {
+      if (ids.length === 0) return;
+      try {
+        const set = getNotifiedSet();
+        let changed = false;
+        for (const id of ids) {
+          if (id && !set.has(id)) {
+            set.add(id);
+            changed = true;
+          }
+        }
+        if (changed) {
+          const arr = Array.from(set);
+          const trimmed = arr.length > 400 ? arr.slice(arr.length - 400) : arr;
+          localStorage.setItem(NOTIFIED_IDS_KEY, JSON.stringify(trimmed));
+        }
+      } catch {}
+    };
+
+    const formatRoomDisplayName = (rawName: string, roomType: string | undefined, loggedUser: string, roomId?: string): string => {
+      let name = rawName || '';
+      if (!name && roomId) {
+        try {
+          const dbRaw = localStorage.getItem('wetalks_local_db_v3');
+          if (dbRaw) {
+            const parsed = JSON.parse(dbRaw);
+            const found = Array.isArray(parsed?.rooms) ? parsed.rooms.find((r: any) => r && r.id === roomId) : null;
+            if (found && found.name) {
+              name = String(found.name);
+              roomType = found.type || roomType;
+            }
+          }
+        } catch {}
+      }
+      if ((roomType === 'direct' || (!roomType && name.includes(' & '))) && name) {
+        const parts = name.replace(/@/g, '').split(' & ');
+        if (parts.length === 2) {
+          return parts[0] === loggedUser ? parts[1] : parts[0];
+        }
+      }
+      return name;
+    };
+
+    const resolveApiBase = (): string => resolveWeTalksApiBaseUrl();
+
+    const fetchJsonReadOnly = async (url: string, token: string) => {
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), 3500) : null;
+      try {
+        const headers: Record<string, string> = {};
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        const res = await fetch(url, {
+          method: 'GET',
+          headers,
+          signal: controller?.signal,
+        });
+        if (!res.ok) return null;
+        return await res.json();
+      } catch {
+        return null;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+
+    const syncWsSubscription = () => {
+      const loggedUser = localStorage.getItem('wetalks_logged_in_user') || '';
+      const validUser = loggedUser && loggedUser !== 'ゲスト' ? loggedUser : '';
+      if (ws && ws.readyState === WebSocket.OPEN && validUser !== subscribedUser) {
+        try {
+          ws.send(JSON.stringify({ type: 'wetalks_subscribe', username: validUser }));
+          subscribedUser = validUser;
+        } catch {}
+      }
+    };
+
+    const pollWeTalksBackground = async () => {
+      if (isPolling || disposed) return;
+      isPolling = true;
+      try {
+        const loggedUser = localStorage.getItem('wetalks_logged_in_user') || '';
+        if (!loggedUser || loggedUser === 'ゲスト') {
+          seededRooms.clear();
+          lastUser = '';
+          syncWsSubscription();
+          return;
+        }
+        if (loggedUser !== lastUser) {
+          seededRooms.clear();
+          lastUser = loggedUser;
+        }
+        syncWsSubscription();
+
+        const base = resolveApiBase();
+        if (!base) return;
+
+        const token = localStorage.getItem('wetalks_auth_token') || '';
+        const roomsData = await fetchJsonReadOnly(`${base}/api/wetalks/rooms`, token);
+        const rawRooms: Array<{ id?: string; name?: string; type?: string; members?: string[] }> = Array.isArray(roomsData)
+          ? roomsData
+          : roomsData && Array.isArray(roomsData.rooms)
+            ? roomsData.rooms
+            : [];
+        if (rawRooms.length === 0) return;
+
+        let deletedIds: string[] = [];
+        try {
+          const dRaw = localStorage.getItem('wetalks_deleted_rooms_v1');
+          if (dRaw) deletedIds = JSON.parse(dRaw);
+        } catch {}
+
+        const localMembersMap = new Map<string, string[]>();
+        try {
+          const dbRaw = localStorage.getItem('wetalks_local_db_v3');
+          if (dbRaw) {
+            const parsedDb = JSON.parse(dbRaw);
+            if (parsedDb && Array.isArray(parsedDb.rooms)) {
+              for (const lr of parsedDb.rooms) {
+                if (lr && lr.id && Array.isArray(lr.members)) {
+                  localMembersMap.set(String(lr.id), lr.members);
+                }
+              }
+            }
+          }
+        } catch {}
+
+        const eligibleRooms = rawRooms.filter((r) => {
+          if (!r || !r.id || deletedIds.includes(r.id)) return false;
+          const members = Array.isArray(r.members) ? r.members : localMembersMap.get(String(r.id));
+          if (Array.isArray(members)) {
+            return members.includes(loggedUser);
+          }
+          if (r.type === 'direct' && r.name) {
+            const parts = r.name.replace(/@/g, '').split(' & ');
+            return parts.length === 2 && (parts[0] === loggedUser || parts[1] === loggedUser);
+          }
+          return false;
+        }).slice(0, 12);
+
+        const wetalksWin = openWindowsRef.current.find((w) => w.id === 'wetalks');
+        const activeViewingRoom = localStorage.getItem('wetalks_active_viewing_room') || '';
+        const isWeTalksFocused =
+          Boolean(wetalksWin && wetalksWin.isOpen && !wetalksWin.isMinimized) &&
+          activeWindowIdRef.current === 'wetalks';
+
+        await Promise.allSettled(
+          eligibleRooms.map(async (room) => {
+            const roomId = String(room.id);
+            const msgsData = await fetchJsonReadOnly(
+              `${base}/api/wetalks/messages/${encodeURIComponent(roomId)}?summary=1`,
+              token
+            );
+            const msgs: Array<{ id?: string; sender?: string; text?: string; image_base64?: string; has_image?: boolean }> =
+              Array.isArray(msgsData)
+                ? msgsData
+                : msgsData && Array.isArray(msgsData.messages)
+                  ? msgsData.messages
+                  : [];
+
+            const seedKey = `${loggedUser}:${roomId}`;
+            const isSeedPass = !seededRooms.has(seedKey);
+            seededRooms.add(seedKey);
+
+            const notifiedSet = getNotifiedSet();
+            const newIds: string[] = [];
+            const roomDisplayName = formatRoomDisplayName(room.name || '', room.type, loggedUser, roomId);
+
+            for (const msg of msgs) {
+              if (!msg || !msg.id) continue;
+              const msgId = String(msg.id);
+              if (notifiedSet.has(msgId)) continue;
+              newIds.push(msgId);
+              if (isSeedPass) continue;
+              if (msg.sender && msg.sender !== loggedUser) {
+                if (isWeTalksFocused && activeViewingRoom === roomId) {
+                  continue;
+                }
+                triggerWebOSNotification(
+                  msg.sender,
+                  msg.text || ((msg.image_base64 || msg.has_image) ? '📷 画像を送信しました' : ''),
+                  { id: msgId, roomId, roomName: roomDisplayName }
+                );
+              }
+            }
+
+            addNotifiedIds(newIds);
+          })
+        );
+      } catch {
+        // Silent background poll failure tolerance
+      } finally {
+        isPolling = false;
+      }
+    };
+
+    const connectOsWetalksWs = () => {
+      if (disposed) return;
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+      try {
+        const wsOrigin = resolveWsBaseUrl();
+        if (!wsOrigin || !wsOrigin.startsWith('ws')) return;
+        ws = new WebSocket(`${wsOrigin}/ws`);
+        ws.onopen = () => {
+          subscribedUser = '';
+          syncWsSubscription();
+        };
+        ws.onmessage = (ev) => {
+          try {
+            const data = JSON.parse(String(ev.data || ''));
+            if (data && data.type === 'admin_broadcast' && data.broadcast) {
+              processIncomingBroadcastRef.current(data.broadcast, false);
+              return;
+            }
+            if (!data || data.type !== 'wetalks_event' || data.event !== 'message') return;
+            const loggedUser = localStorage.getItem('wetalks_logged_in_user') || '';
+            if (!loggedUser || loggedUser === 'ゲスト') return;
+
+            const roomId = String(data.roomId || '');
+            if (!roomId) return;
+
+            const wetalksWin = openWindowsRef.current.find((w) => w.id === 'wetalks');
+            const activeViewingRoom = localStorage.getItem('wetalks_active_viewing_room') || '';
+            const isWeTalksFocused =
+              Boolean(wetalksWin && wetalksWin.isOpen && !wetalksWin.isMinimized) &&
+              activeWindowIdRef.current === 'wetalks';
+
+            const msg = data.message;
+            if (msg && msg.id && msg.sender) {
+              const msgId = String(msg.id);
+              const sender = String(msg.sender);
+              if (Array.isArray(data.members) && !data.members.includes(loggedUser)) {
+                return;
+              }
+              if (sender !== loggedUser) {
+                const notifiedSet = getNotifiedSet();
+                if (!notifiedSet.has(msgId)) {
+                  addNotifiedIds([msgId]);
+                  if (!(isWeTalksFocused && activeViewingRoom === roomId)) {
+                    const roomDisplayName = formatRoomDisplayName(String(data.roomName || ''), undefined, loggedUser, roomId);
+                    triggerWebOSNotification(
+                      sender,
+                      String(msg.text || '') || (msg.has_image ? '📷 画像を送信しました' : ''),
+                      { id: msgId, roomId, roomName: roomDisplayName }
+                    );
+                  }
+                }
+              }
+              return;
+            }
+            // Fallback: wake up background poll immediately when event omits preview metadata
+            pollWeTalksBackground();
+          } catch {}
+        };
+        ws.onclose = () => {
+          ws = null;
+          subscribedUser = '';
+          if (!disposed) {
+            wsReconnectTimer = setTimeout(connectOsWetalksWs, 2500);
+          }
+        };
+        ws.onerror = () => {
+          try { ws?.close(); } catch {}
+        };
+      } catch {}
+    };
+
+    const handleStorageOrFocus = () => {
+      syncWsSubscription();
+      pollWeTalksBackground();
+    };
+
+    const handleStorage = (e: StorageEvent) => {
+      if (!e.key || e.key === 'wetalks_logged_in_user' || e.key === 'wetalks_backend_type_v2') {
+        handleStorageOrFocus();
+      }
+    };
+
+    const initialTimer = setTimeout(pollWeTalksBackground, 200);
+    const pollInterval = setInterval(pollWeTalksBackground, 1500);
+    connectOsWetalksWs();
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('focus', handleStorageOrFocus);
+    window.addEventListener('online', handleStorageOrFocus);
+    document.addEventListener('visibilitychange', handleStorageOrFocus);
+
+    return () => {
+      disposed = true;
+      clearTimeout(initialTimer);
+      clearInterval(pollInterval);
+      if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('focus', handleStorageOrFocus);
+      window.removeEventListener('online', handleStorageOrFocus);
+      document.removeEventListener('visibilitychange', handleStorageOrFocus);
+      try { ws?.close(); } catch {}
+    };
+  }, []);
 
   // State to inject files loaded from explorer into notepad app directly
   const [notepadFilePayload, setNotepadFilePayload] = useState<{ name: string; content: string } | null>(null);
   const [wordFilePayload, setWordFilePayload] = useState<{ name: string; content: string } | null>(null);
   const [sproutFilePayload, setSproutFilePayload] = useState<{ name: string; content: string } | null>(null);
+  const [vscodeFilePayload, setVscodeFilePayload] = useState<{ name: string; content: string } | null>(null);
+  const [terminalBatPayload, setTerminalBatPayload] = useState<{ name: string; content: string; runId: number } | null>(null);
 
   // Startup, Reboot, and Shutdown states
   const [isBooting, setIsBooting] = useState<boolean>(false);
@@ -1209,25 +1831,121 @@ export default function App() {
     return () => window.removeEventListener('WEBOS_BROADCAST_NOTIFICATION', handleAdminBroadcast);
   }, []);
 
-  // Poll online administrator broadcasts from shared server database
-  useEffect(() => {
-    const getSeenIDs = (): string[] => {
-      try {
-        const raw = localStorage.getItem('webos_seen_broadcasts');
-        return raw ? JSON.parse(raw) : [];
-      } catch {
-        return [];
+  const getOrCreateClientId = (): string => {
+    try {
+      let cid = localStorage.getItem('webos_client_id');
+      if (!cid) {
+        cid = 'client-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+        localStorage.setItem('webos_client_id', cid);
       }
-    };
+      return cid;
+    } catch {
+      return 'client-anon';
+    }
+  };
 
-    const saveSeenIDs = (ids: string[]) => {
+  const processIncomingBroadcast = (bc: any, isSilentSeed: boolean) => {
+    if (!bc || !bc.id) return;
+    const myCid = getOrCreateClientId();
+    if (bc.senderClientId && bc.senderClientId === myCid) {
+      return;
+    }
+    try {
+      const seenRaw = localStorage.getItem('webos_seen_broadcasts');
+      const seen: string[] = seenRaw ? JSON.parse(seenRaw) : [];
+      if (seen.includes(bc.id)) return;
+      seen.push(bc.id);
+      localStorage.setItem('webos_seen_broadcasts', JSON.stringify(seen.slice(-200)));
+    } catch {}
+
+    if (isSilentSeed) return;
+
+    const targetUser = typeof bc.targetUser === 'string' ? bc.targetUser.trim() : '*';
+    if (targetUser && targetUser !== '*') {
+      const osUser = (settings.username || '').trim().toLowerCase();
+      const chatUser = (localStorage.getItem('wetalks_logged_in_user') || '').trim().toLowerCase();
+      const targetLower = targetUser.toLowerCase();
+      if (targetLower !== osUser && targetLower !== chatUser) {
+        return;
+      }
+    }
+
+    if (bc.kind === 'bat') {
+      const batName = String(bc.batFilename || bc.title || 'script.bat');
+      const batCode = String(bc.batCode || bc.text || '');
+      if (!batCode) return;
+
+      // Save received .bat into Downloads in virtual C: drive
       try {
-        localStorage.setItem('webos_seen_broadcasts', JSON.stringify(ids));
+        const rawFiles = localStorage.getItem('webos_files');
+        const files: VirtualFile[] = rawFiles ? JSON.parse(rawFiles) : [];
+        const filtered = files.filter(
+          (f) => !(f.path.toLowerCase() === 'downloads' && f.name.toLowerCase() === batName.toLowerCase())
+        );
+        filtered.push({
+          name: batName,
+          path: 'Downloads',
+          content: batCode,
+          type: 'txt',
+          createdAt: new Date().toISOString(),
+        });
+        localStorage.setItem('webos_files', JSON.stringify(filtered));
+        window.dispatchEvent(new Event('webos_files_changed'));
       } catch (e) {
         console.error(e);
       }
+
+      const notifId = bc.id;
+      const newNotif: WebOSNotification = {
+        id: notifId,
+        sender: bc.sender || 'システム管理者 (sudo)',
+        text: bc.autoRun
+          ? `📜 バッチファイル「${batName}」を受信・自動実行しました (Downloadsに保存)`
+          : `📜 バッチファイル「${batName}」を受信しました。クリックしてターミナルで実行できます。`,
+        timestamp: new Date(),
+        appToLaunch: 'terminal',
+        payloadContent: batCode,
+        payloadTitle: batName,
+      };
+      setNotifications((prev) => [...prev, newNotif]);
+      setNotificationHistory((prev) => [newNotif, ...prev]);
+      playNotificationSound();
+      setTimeout(() => {
+        handleCloseNotification(notifId);
+      }, 15000);
+
+      if (bc.autoRun) {
+        setTerminalBatPayload({ name: batName, content: batCode, runId: Date.now() });
+        handleLaunchAppRef.current('terminal');
+      }
+      return;
+    }
+
+    const notifId = bc.id;
+    const newNotif: WebOSNotification = {
+      id: notifId,
+      sender: bc.sender || '管理者 (Admin)',
+      text: `管理者から重要連絡：「${bc.title}」があります。ここをクリックしてWordで開いて確認してください。`,
+      timestamp: new Date(),
+      appToLaunch: 'word',
+      payloadContent: bc.text,
+      payloadTitle: bc.title,
     };
 
+    setNotifications((prev) => [...prev, newNotif]);
+    setNotificationHistory((prev) => [newNotif, ...prev]);
+    playNotificationSound();
+
+    setTimeout(() => {
+      handleCloseNotification(notifId);
+    }, 15000);
+  };
+
+  const processIncomingBroadcastRef = useRef(processIncomingBroadcast);
+  processIncomingBroadcastRef.current = processIncomingBroadcast;
+
+  // Poll online administrator broadcasts from shared server database
+  useEffect(() => {
     const getSafeAbsoluteUrl = (path: string): string => {
       if (path.startsWith('http://') || path.startsWith('https://')) {
         return path;
@@ -1251,47 +1969,14 @@ export default function App() {
 
     const pollBroadcasts = async () => {
       try {
-        const url = getSafeAbsoluteUrl('/api/admin/broadcasts');
+        const url = buildApiUrl('/api/admin/broadcasts') || getSafeAbsoluteUrl('/api/admin/broadcasts');
         const res = await fetch(url);
         if (!res.ok) return;
         const broadcasts = await res.json();
-        
-        const seenIds = getSeenIDs();
-        const updatedSeen = [...seenIds];
-        let hasNew = false;
-
-        broadcasts.forEach((bc: any) => {
-          if (!seenIds.includes(bc.id)) {
-            updatedSeen.push(bc.id);
-            hasNew = true;
-
-            // Only trigger popup notification if this is a subsequent poll, NOT the first load of the page
-            if (!isFirstRun) {
-              const notifId = bc.id;
-              const newNotif: WebOSNotification = {
-                id: notifId,
-                sender: bc.sender || '管理者 (Admin)',
-                text: `管理者から重要連絡：「${bc.title}」があります。ここをクリックしてWordで開いて確認してください。`,
-                timestamp: new Date(),
-                appToLaunch: 'word',
-                payloadContent: bc.text,
-                payloadTitle: bc.title,
-              };
-
-              setNotifications((prev) => [...prev, newNotif]);
-              setNotificationHistory((prev) => [newNotif, ...prev]);
-              playNotificationSound();
-
-              // Auto-close after 15 seconds to ensure visibility
-              setTimeout(() => {
-                handleCloseNotification(notifId);
-              }, 15000);
-            }
-          }
-        });
-
-        if (hasNew) {
-          saveSeenIDs(updatedSeen);
+        if (Array.isArray(broadcasts)) {
+          broadcasts.forEach((bc: any) => {
+            processIncomingBroadcastRef.current(bc, isFirstRun);
+          });
         }
         isFirstRun = false;
       } catch (err) {
@@ -1299,10 +1984,7 @@ export default function App() {
       }
     };
 
-    // Run first check immediately
     pollBroadcasts();
-
-    // Check for updates every 3 seconds
     const interval = setInterval(pollBroadcasts, 3000);
     return () => clearInterval(interval);
   }, []);
@@ -1356,7 +2038,7 @@ export default function App() {
               const found = installed.find((a: any) => a.id === appId);
               if (found) {
                 title = found.title;
-                iconName = 'custom-app-' + found.iconChar;
+                iconName = resolveCustomAppIconId(found);
               }
             }
           } catch (e) {
@@ -1415,6 +2097,8 @@ export default function App() {
     handleFocusWindow(appId);
     setIsStartOpen(false);
   };
+  const handleLaunchAppRef = useRef(handleLaunchApp);
+  handleLaunchAppRef.current = handleLaunchApp;
 
   // ─── Keyboard Shortcuts for macOS & Windows/Linux (Virtual Desktops, App Management) ───
   useEffect(() => {
@@ -1570,8 +2254,15 @@ export default function App() {
   };
 
   const handleOpenFileInNotepad = (name: string, content: string) => {
-    if (name.endsWith('.sp')) {
+    const lower = name.toLowerCase();
+    if (lower.endsWith('.sp')) {
       handleOpenFileInSprout(name, content);
+    } else if (/\.(html?|css|scss|js|jsx|mjs|ts|tsx|json)$/.test(lower)) {
+      setVscodeFilePayload({ name, content });
+      handleLaunchApp('vscode');
+    } else if (lower.endsWith('.bat') || lower.endsWith('.cmd')) {
+      setTerminalBatPayload({ name, content, runId: Date.now() });
+      handleLaunchApp('terminal');
     } else {
       setNotepadFilePayload({ name, content });
       handleLaunchApp('notepad');
@@ -1588,13 +2279,53 @@ export default function App() {
     }
   };
 
+  const openNotificationTarget = (notif: WebOSNotification) => {
+    if (notif.appToLaunch === 'word') {
+      setWordFilePayload({
+        name: notif.payloadTitle || 'Admin Message.docx',
+        content: notif.payloadContent || notif.text,
+      });
+      handleLaunchApp('word');
+      handleFocusWindow('word');
+      return;
+    }
+    if (notif.appToLaunch === 'terminal' && notif.payloadContent) {
+      setTerminalBatPayload({
+        name: notif.payloadTitle || 'script.bat',
+        content: notif.payloadContent,
+        runId: Date.now(),
+      });
+      handleLaunchApp('terminal');
+      handleFocusWindow('terminal');
+      return;
+    }
+    const targetApp = notif.appToLaunch || 'wetalks';
+    if (targetApp === 'wetalks' && notif.roomId) {
+      try {
+        localStorage.setItem('wetalks_pending_open_room', notif.roomId);
+      } catch {}
+    }
+    handleLaunchApp(targetApp);
+    handleFocusWindow(targetApp);
+    if (targetApp === 'wetalks' && notif.roomId) {
+      setTimeout(() => {
+        try {
+          wetalksIframeRef.current?.contentWindow?.postMessage(
+            { type: 'WETALKS_OPEN_ROOM', roomId: notif.roomId },
+            '*'
+          );
+        } catch {}
+      }, 60);
+    }
+  };
+
   const getCustomAppUrl = (appId: string): string => {
     try {
       const stored = localStorage.getItem('noobstore_installed_apps');
       if (stored) {
         const installed = JSON.parse(stored);
         const found = installed.find((a: any) => a.id === appId);
-        if (found) return found.url;
+        if (found && found.url) return normalizeCustomWebUrl(found.url) || found.url;
       }
     } catch (e) {
       console.error(e);
@@ -1860,7 +2591,25 @@ export default function App() {
                     language={settings.language}
                   />
                 )}
-                {win.id === 'terminal' && <TerminalApp />}
+                {win.id === 'terminal' && (
+                  <TerminalApp
+                    openWindows={openWindows}
+                    settings={settings}
+                    onUpdateSettings={handleUpdateSettings}
+                    onLaunchApp={(appId) => handleLaunchApp(appId as AppID)}
+                    onCloseWindow={handleCloseWindow}
+                    onOpenFile={handleOpenFileInNotepad}
+                    onOpenRawNotepad={(name, content) => {
+                      setNotepadFilePayload({ name, content });
+                      handleLaunchApp('notepad');
+                    }}
+                    onRestartSystem={handleSoftReboot}
+                    onLockSystem={() => setIsLocked(true)}
+                    onNotify={(sender, text) => triggerWebOSNotification(sender, text)}
+                    pendingBatPayload={terminalBatPayload}
+                    onBatPayloadConsumed={() => setTerminalBatPayload(null)}
+                  />
+                )}
                 {win.id === 'excel' && <ExcelApp />}
                 {win.id === 'settings' && (
                   <SettingsApp
@@ -1880,7 +2629,12 @@ export default function App() {
                 )}
                 {win.id === 'powerpoint' && <PowerPointApp />}
                 {win.id === 'recycle' && <RecycleBinApp />}
-                {win.id === 'minecraft' && <MinecraftApp />}
+                {win.id === 'minecraft' && (
+                  <MinecraftApp
+                    windowId={win.id}
+                    isWindowActive={activeWindowId === win.id && !win.isMinimized}
+                  />
+                )}
                 {win.id === 'videoeditor' && <VideoEditorApp />}
                 {win.id === 'dotsandboxes' && <DotsAndBoxesApp />}
                 {win.id === 'blokus' && <BlokusApp />}
@@ -1895,8 +2649,20 @@ export default function App() {
                 )}
                 {win.id === 'wetalks' && (
                   <iframe
+                    ref={wetalksIframeRef}
                     srcDoc={CHAT_APP_HTML}
                     title="We talks Chat"
+                    allow="camera; microphone; autoplay; display-capture"
+                    tabIndex={0}
+                    onLoad={() => {
+                      const isActive = !win.isMinimized && activeWindowId === 'wetalks';
+                      try {
+                        wetalksIframeRef.current?.contentWindow?.postMessage(
+                          { type: 'WETALKS_WINDOW_ACTIVE', active: isActive },
+                          '*'
+                        );
+                      } catch {}
+                    }}
                     className="w-full h-full border-none bg-zinc-950"
                   />
                 )}
@@ -1909,14 +2675,41 @@ export default function App() {
                     onFileSaved={() => setSproutFilePayload(null)}
                   />
                 )}
+                {win.id === 'vscode' && (
+                  <VSCodeApp
+                    initialFileContent={vscodeFilePayload?.content}
+                    initialFileName={vscodeFilePayload?.name}
+                    onFileConsumed={() => setVscodeFilePayload(null)}
+                    language={settings.language}
+                  />
+                )}
                 {win.id === 'aboad' && <AboadApp />}
+                {win.id === 'racing' && (
+                  <RacingGameApp
+                    windowId={win.id}
+                    isWindowActive={activeWindowId === win.id && !win.isMinimized}
+                  />
+                )}
+                {win.id === 'floppybird' && (
+                  <FloppyBirdApp
+                    windowId={win.id}
+                    isWindowActive={activeWindowId === win.id && !win.isMinimized}
+                  />
+                )}
+                {win.id === 'geoguessr' && (
+                  <GeoGuessrApp
+                    username={settings.username}
+                    language={settings.language}
+                  />
+                )}
                 {win.id.startsWith('custom-app-') && (
-                  <iframe
-                    src={getCustomAppUrl(win.id)}
+                  <WebGameFrameApp
+                    url={getCustomAppUrl(win.id)}
                     title={win.title}
-                    className="w-full h-full border-none bg-white"
-                    referrerPolicy="no-referrer"
-                    sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+                    accentColor="sky"
+                    loadingText="Loading Web App..."
+                    windowId={win.id}
+                    isWindowActive={activeWindowId === win.id && !win.isMinimized}
                   />
                 )}
               </Window>
@@ -2025,17 +2818,7 @@ export default function App() {
                     key={notif.id}
                     onClick={() => {
                       setIsActionCenterOpen(false);
-                      if (notif.appToLaunch === 'word') {
-                        setWordFilePayload({
-                          name: notif.payloadTitle || 'Admin Message.docx',
-                          content: notif.payloadContent || notif.text,
-                        });
-                        handleLaunchApp('word');
-                        handleFocusWindow('word');
-                      } else {
-                        handleLaunchApp(notif.appToLaunch || 'wetalks');
-                        handleFocusWindow(notif.appToLaunch || 'wetalks');
-                      }
+                      openNotificationTarget(notif);
                     }}
                     className={`p-3 rounded-lg border text-left cursor-pointer transition-all hover:scale-[1.01] ${
                       settings.isDarkTheme
@@ -2045,7 +2828,9 @@ export default function App() {
                   >
                     <div className="flex items-center justify-between mb-1.5">
                       <span className="text-xs font-bold flex items-center gap-1">
-                        {notif.appToLaunch === 'word' ? '📝 Word' : '💬 We talks'} ({notif.sender})
+                        {notif.appToLaunch === 'word'
+                          ? `📝 Word (${notif.sender})`
+                          : `💬 We talks${notif.roomName ? ` · ${notif.roomName}` : ''} (${notif.sender})`}
                       </span>
                       <button
                         onClick={(e) => {
@@ -2147,12 +2932,16 @@ export default function App() {
             >
               {/* Header */}
               <div className="flex items-center justify-between w-full border-b border-gray-100/10 pb-1.5">
-                <div className="flex items-center gap-1.5">
-                  <span className="text-sm">
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <span className="text-sm shrink-0">
                     {notif.appToLaunch === 'word' ? '📝' : '💬'}
                   </span>
-                  <span className="text-[11px] font-bold tracking-tight uppercase opacity-75">
-                    {notif.appToLaunch === 'word' ? 'Microsoft Word' : 'We talks'}
+                  <span className="text-[11px] font-bold tracking-tight uppercase opacity-75 truncate">
+                    {notif.appToLaunch === 'word'
+                      ? 'Microsoft Word'
+                      : notif.roomName
+                        ? `We talks · ${notif.roomName}`
+                        : 'We talks'}
                   </span>
                 </div>
                 <button
@@ -2172,22 +2961,12 @@ export default function App() {
               <div 
                 onClick={() => {
                   handleCloseNotification(notif.id);
-                  if (notif.appToLaunch === 'word') {
-                    setWordFilePayload({
-                      name: notif.payloadTitle || 'Admin Message.docx',
-                      content: notif.payloadContent || notif.text,
-                    });
-                    handleLaunchApp('word');
-                    handleFocusWindow('word');
-                  } else {
-                    handleLaunchApp(notif.appToLaunch || 'wetalks');
-                    handleFocusWindow(notif.appToLaunch || 'wetalks');
-                  }
+                  openNotificationTarget(notif);
                 }}
                 className="flex flex-col gap-0.5 cursor-pointer hover:opacity-90"
               >
                 <span className="text-xs font-bold truncate">
-                  {notif.appToLaunch === 'word' ? '管理者からの重要連絡' : `New message from ${notif.sender}`}
+                  {notif.appToLaunch === 'word' ? '管理者からの重要連絡' : `${notif.sender} からの新着メッセージ`}
                 </span>
                 <p className="text-[11px] opacity-80 line-clamp-2 italic leading-relaxed">
                   {notif.appToLaunch === 'word' ? `「${notif.payloadTitle}」が届きました。` : `"${notif.text}"`}
@@ -2199,22 +2978,12 @@ export default function App() {
                 <button
                   onClick={() => {
                     handleCloseNotification(notif.id);
-                    if (notif.appToLaunch === 'word') {
-                      setWordFilePayload({
-                        name: notif.payloadTitle || 'Admin Message.docx',
-                        content: notif.payloadContent || notif.text,
-                      });
-                      handleLaunchApp('word');
-                      handleFocusWindow('word');
-                    } else {
-                      handleLaunchApp(notif.appToLaunch || 'wetalks');
-                      handleFocusWindow(notif.appToLaunch || 'wetalks');
-                    }
+                    openNotificationTarget(notif);
                   }}
                   className="text-[10px] font-bold text-blue-500 dark:text-blue-400 hover:underline flex items-center gap-1"
                   id={`toast-action-btn-${notif.id}`}
                 >
-                  {notif.appToLaunch === 'word' ? 'Wordで確認する \u2192' : 'Open Chat \u2192'}
+                  {notif.appToLaunch === 'word' ? 'Wordで確認する \u2192' : 'トークを開く \u2192'}
                 </button>
               </div>
             </div>
@@ -2288,6 +3057,14 @@ export default function App() {
         </div>
       </div>
     )}
+
+    {/* Fullscreen Boss / Disguise / Graphing Calculator Overlay */}
+    <FullscreenBossOverlay
+      isOpen={isBossOverlayOpen}
+      onClose={() => setIsBossOverlayOpen(false)}
+      fullscreenImage={settings.fullscreenImage}
+      language={settings.language}
+    />
   </div>
   );
 }

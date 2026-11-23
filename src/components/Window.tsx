@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { WindowInstance } from '../types';
 import { Minimize2, Square, Copy, X } from 'lucide-react';
+import { AppIcon } from './AppIcon';
 
 interface WindowProps {
   windowState: WindowInstance;
@@ -62,8 +63,14 @@ export const Window: React.FC<WindowProps> = ({
   };
 
   // Focus window on click anywhere inside
-  const handlePointerDown = () => {
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     onFocus(id);
+    const target = e.target as HTMLElement | null;
+    if (target && !target.closest('button, input, textarea, select, a, [contenteditable="true"]')) {
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('webos_window_focus_settled', { detail: { id } }));
+      }, 0);
+    }
   };
 
   // Drag Titlebar handlers
@@ -251,6 +258,9 @@ export const Window: React.FC<WindowProps> = ({
         width: lastProps.current.width,
         height: lastProps.current.height,
       });
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('webos_window_focus_settled', { detail: { id } }));
+      }, 20);
     }
   };
 
@@ -305,13 +315,13 @@ export const Window: React.FC<WindowProps> = ({
       onPointerDown={handlePointerDown}
       onContextMenu={(e) => e.stopPropagation()}
       className={`absolute flex flex-col rounded-t-xl overflow-hidden border select-text shadow-2xl origin-center ${
-        id === 'sprout'
+        id === 'sprout' || id === 'vscode'
           ? 'bg-[#1e1e1e] border-zinc-800'
           : 'bg-white border-gray-200/80'
       } ${
         isMaximized
           ? 'rounded-none border-none'
-          : id === 'sprout'
+          : id === 'sprout' || id === 'vscode'
             ? 'ring-1 ring-black/40'
             : 'ring-1 ring-black/5'
       } ${animationClass}`}
@@ -341,7 +351,7 @@ export const Window: React.FC<WindowProps> = ({
             ? 'bg-gradient-to-b from-[#1c2432] to-[#0f1520] text-sky-100 border-b border-white/10 font-semibold'
             : osTheme === 'win7'
             ? 'bg-gradient-to-b from-sky-500/80 via-blue-700/80 to-blue-900/80 text-white border-b border-cyan-300/40 shadow-xs font-semibold'
-            : id === 'sprout'
+            : id === 'sprout' || id === 'vscode'
             ? 'bg-[#181818] border-b border-[#2d2d2d] text-zinc-300'
             : 'bg-[#f3f4f6]/95 border-b border-gray-200/80 text-gray-800'
         }`}
@@ -395,6 +405,9 @@ export const Window: React.FC<WindowProps> = ({
               {icon === 'powerpoint' && <span className="text-xs shrink-0 select-none">🍊</span>}
               {icon === 'sprout' && <span className="text-xs shrink-0 select-none">🌱</span>}
               {icon === 'aboad' && <span className="text-xs shrink-0 select-none">🌐</span>}
+              {(icon === 'racing' || icon === 'floppybird' || icon === 'vscode' || icon.startsWith('cweb-') || icon.startsWith('custom-app-')) && (
+                <AppIcon id={icon} size={15} className="shrink-0" />
+              )}
               <span className="text-xs font-medium truncate tracking-tight text-gray-700 dark:text-gray-200">{title}</span>
             </div>
 
@@ -419,7 +432,10 @@ export const Window: React.FC<WindowProps> = ({
                   {icon === 'powerpoint' && <span className="w-4.5 h-4.5 shrink-0 select-none">🍊</span>}
                   {icon === 'sprout' && <span className="w-4.5 h-4.5 shrink-0 select-none">🌱</span>}
                   {icon === 'aboad' && <span className="w-4.5 h-4.5 shrink-0 select-none">🌐</span>}
-                  <span className={`text-xs font-semibold truncate ${id === 'sprout' ? 'text-zinc-300' : 'text-gray-700'}`}>{title}</span>
+                  {(icon === 'racing' || icon === 'floppybird' || icon === 'vscode' || icon.startsWith('cweb-') || icon.startsWith('custom-app-')) && (
+                    <AppIcon id={icon} size={17} className="shrink-0" />
+                  )}
+                  <span className={`text-xs font-semibold truncate ${id === 'sprout' || id === 'vscode' ? 'text-zinc-300' : 'text-gray-700'}`}>{title}</span>
                 </>
               )}
             </div>
@@ -433,7 +449,7 @@ export const Window: React.FC<WindowProps> = ({
               <button
                 onClick={() => onUpdate(id, { isMinimized: true })}
                 className={`p-1.5 rounded transition-colors ${
-                  id === 'sprout'
+                  id === 'sprout' || id === 'vscode'
                     ? 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100'
                     : 'text-gray-500 hover:bg-gray-200'
                 }`}
@@ -445,7 +461,7 @@ export const Window: React.FC<WindowProps> = ({
               <button
                 onClick={toggleMaximize}
                 className={`p-1.5 rounded transition-colors ${
-                  id === 'sprout'
+                  id === 'sprout' || id === 'vscode'
                     ? 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100'
                     : 'text-gray-500 hover:bg-gray-200'
                 }`}
@@ -457,7 +473,7 @@ export const Window: React.FC<WindowProps> = ({
               <button
                 onClick={handleClose}
                 className={`p-1.5 rounded transition-colors ${
-                  id === 'sprout'
+                  id === 'sprout' || id === 'vscode'
                     ? 'text-zinc-400 hover:bg-red-600 hover:text-white'
                     : 'text-gray-500 hover:bg-red-600 hover:text-white'
                 }`}

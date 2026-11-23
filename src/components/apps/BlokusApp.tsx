@@ -1,14 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { createClient } from '@supabase/supabase-js';
+import { createWsRoomChannel, WsRoomChannel } from '../../utils/wsRelay';
 import { 
   Play, Users, Bot, Layers, ArrowLeft, RefreshCw, Trophy, 
   Volume2, VolumeX, Sparkles, AlertCircle, RotateCw, FlipHorizontal, 
   Check, Swords, Flame, Sparkle
 } from 'lucide-react';
-
-// --- Supabase Credentials ---
-const SUPABASE_URL = 'https://nsyvlftqcciyetsbhymg.supabase.co';
-const SUPABASE_ANON_KEY = 'sb_publishable_lkhrFuMlNyEmUX4RTFApKw_AhD1sAkV';
 
 // --- Types & Interfaces ---
 interface Piece {
@@ -118,14 +114,16 @@ export const BlokusApp: React.FC = () => {
   const [hoveredCell, setHoveredCell] = useState<{ r: number; c: number } | null>(null);
   const [pendingPlacement, setPendingPlacement] = useState<{ r: number; c: number } | null>(null);
 
-  // --- Online Multiplayer (Supabase) States ---
+  // --- Online Multiplayer (WebSocket Relay) States ---
   const [roomCode, setRoomCode] = useState<string>('');
   const [isCreator, setIsCreator] = useState<boolean>(false);
   const [onlinePlayerColor, setOnlinePlayerColor] = useState<PlayerColor>('blue');
   const [statusText, setStatusText] = useState<string>('');
   const [errorText, setErrorText] = useState<string>('');
-  const supabaseRef = useRef<any>(null);
-  const channelRef = useRef<any>(null);
+  const myMemberIdRef = useRef<string>('bk_' + Math.random().toString(36).slice(2, 8));
+  const gameStateRef = useRef(gameState);
+  useEffect(() => { gameStateRef.current = gameState; }, [gameState]);
+  const channelRef = useRef<WsRoomChannel | null>(null);
 
   // --- Synthesis Audio Engine ---
   const playSound = (type: 'clack' | 'click' | 'swish' | 'success' | 'error' | 'victory') => {
@@ -557,19 +555,7 @@ export const BlokusApp: React.FC = () => {
     playSound('click');
   };
 
-  // --- Real-time Room System (Supabase Setup) ---
-  const getSupabaseClient = () => {
-    if (supabaseRef.current) return supabaseRef.current;
-    try {
-      const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-      supabaseRef.current = client;
-      return client;
-    } catch (err) {
-      console.error('Supabase init error:', err);
-      return null;
-    }
-  };
-
+  // --- Real-time Room System (WebSocket Relay) ---
   const handleCreateRoom = () => {
     playSound('click');
     const normalizedRoom = roomCode.trim().toLowerCase();
@@ -580,16 +566,9 @@ export const BlokusApp: React.FC = () => {
     setErrorText('');
     setStatusText('Creating room...');
 
-    const client = getSupabaseClient();
-    if (!client) {
-      setErrorText('Check connection settings');
-      return;
-    }
-
-    // Clean up any existing channel before creating/joining
-    if (channelRef.current && supabaseRef.current) {
+    if (channelRef.current) {
       try {
-        supabaseRef.current.removeChannel(channelRef.current);
+        channelRef.current.unsubscribe();
       } catch (e) {}
       channelRef.current = null;
     }
@@ -598,33 +577,42 @@ export const BlokusApp: React.FC = () => {
       setIsCreator(true);
       setOnlinePlayerColor('blue');
 
-      // Use cleaner syntax as required by the spec
-      const channel = client.channel(`blokus-room-${normalizedRoom}`, {
-        config: { broadcast: { self: false } },
+      const channel = createWsRoomChannel(`blokus-room-${normalizedRoom}`, {
+        memberId: myMemberIdRef.current,
+        username: 'Host',
       });
       channelRef.current = channel;
 
       channel
-        .on('broadcast', { event: 'db_join' }, (payload: any) => {
+        .on('db_join', () => {
           playSound('success');
           setStatusText('Opponent joined! Initializing Blokus Board...');
-          
+
+          const order: PlayerColor[] = config.playerCount === 2 ? ['blue', 'orange'] : ['blue', 'yellow', 'red', 'green'];
           channel.send({
             type: 'broadcast',
             event: 'db_init_board',
             payload: {
               playerCount: config.playerCount,
               boardSize,
-              playersOrder: config.playerCount === 2 ? ['blue', 'orange'] : ['blue', 'yellow', 'red', 'green'],
+              playersOrder: order,
             },
           });
 
-          // Begin Game
           initializeBoardState(config.playerCount);
           setGameState('playing');
         })
-        .on('broadcast', { event: 'db_place_piece' }, (payload: any) => {
-          const { grid: nextGrid, playerDecks: nextDecks, passedPlayers: nextPassed, currentTurn: nextTurn, gameState: nextGameState } = payload.payload;
+        .on('relay_member_joined', () => {
+          if (gameStateRef.current === 'room') {
+            channel.send({
+              type: 'broadcast',
+              event: 'db_host_ready',
+              payload: { playerCount: config.playerCount, boardSize },
+            });
+          }
+        })
+        .on('db_place_piece', (payload: any) => {
+          const { grid: nextGrid, playerDecks: nextDecks, passedPlayers: nextPassed, currentTurn: nextTurn, gameState: nextGameState } = payload;
           setGrid(nextGrid);
           setPlayerDecks(nextDecks);
           setPassedPlayers(nextPassed);
@@ -635,8 +623,8 @@ export const BlokusApp: React.FC = () => {
             playSound('victory');
           }
         })
-        .on('broadcast', { event: 'db_pass' }, (payload: any) => {
-          const { passedPlayers: nextPassed, currentTurn: nextTurn, gameState: nextGameState } = payload.payload;
+        .on('db_pass', (payload: any) => {
+          const { passedPlayers: nextPassed, currentTurn: nextTurn, gameState: nextGameState } = payload;
           setPassedPlayers(nextPassed);
           setCurrentTurn(nextTurn);
           setGameState(nextGameState);
@@ -645,19 +633,30 @@ export const BlokusApp: React.FC = () => {
             playSound('victory');
           }
         })
-        .on('broadcast', { event: 'db_leave' }, () => {
+        .on('db_restart', (payload: any) => {
+          playSound('click');
+          initializeBoardState(payload.playerCount || config.playerCount);
+          setGameState('playing');
+        })
+        .on('db_leave', () => {
           setStatusText('Opponent disconnected');
-          window.parent.postMessage({
-            type: 'WETALKS_NEW_MESSAGE',
-            payload: { sender: 'System', text: '対戦相手が退出しました。' }
-          }, '*');
+        })
+        .on('relay_member_left', () => {
+          if (gameStateRef.current === 'playing' || gameStateRef.current === 'gameover') {
+            setStatusText('Opponent disconnected');
+          }
         });
 
       channel.subscribe((status: string) => {
         if (status === 'SUBSCRIBED') {
           setGameState('room');
-          setStatusText(`Hosted room [${normalizedRoom}]. Send this code to joiners!`);
-        } else {
+          setStatusText(`Hosted room [${normalizedRoom.toUpperCase()}]. Share this code with your opponent!`);
+          channel.send({
+            type: 'broadcast',
+            event: 'db_host_ready',
+            payload: { playerCount: config.playerCount, boardSize },
+          });
+        } else if (status === 'ERROR') {
           setErrorText('Subscription failed. Try again.');
         }
       });
@@ -676,16 +675,9 @@ export const BlokusApp: React.FC = () => {
     setErrorText('');
     setStatusText('Entering room...');
 
-    const client = getSupabaseClient();
-    if (!client) {
-      setErrorText('Connection error');
-      return;
-    }
-
-    // Clean up any existing channel before creating/joining
-    if (channelRef.current && supabaseRef.current) {
+    if (channelRef.current) {
       try {
-        supabaseRef.current.removeChannel(channelRef.current);
+        channelRef.current.unsubscribe();
       } catch (e) {}
       channelRef.current = null;
     }
@@ -694,25 +686,39 @@ export const BlokusApp: React.FC = () => {
       setIsCreator(false);
       setOnlinePlayerColor(config.playerCount === 2 ? 'orange' : 'yellow');
 
-      const channel = client.channel(`blokus-room-${normalizedRoom}`, {
-        config: { broadcast: { self: false } },
+      const channel = createWsRoomChannel(`blokus-room-${normalizedRoom}`, {
+        memberId: myMemberIdRef.current,
+        username: 'Guest',
       });
       channelRef.current = channel;
+      let boardInitialized = false;
 
       channel
-        .on('broadcast', { event: 'db_init_board' }, (payload: any) => {
+        .on('db_host_ready', () => {
+          if (!boardInitialized) {
+            channel.send({
+              type: 'broadcast',
+              event: 'db_join',
+              payload: { active: true },
+            });
+          }
+        })
+        .on('db_init_board', (payload: any) => {
+          boardInitialized = true;
           playSound('success');
-          const size = payload.payload.boardSize;
-          const order = payload.payload.playersOrder;
-          const count = payload.payload.playerCount;
+          const size = payload.boardSize;
+          const order = payload.playersOrder;
+          const count = payload.playerCount;
 
+          setOnlinePlayerColor(count === 2 ? 'orange' : 'yellow');
           setBoardSize(size);
           setPlayersOrder(order);
           initializeBoardState(count);
+          setStatusText('');
           setGameState('playing');
         })
-        .on('broadcast', { event: 'db_place_piece' }, (payload: any) => {
-          const { grid: nextGrid, playerDecks: nextDecks, passedPlayers: nextPassed, currentTurn: nextTurn, gameState: nextGameState } = payload.payload;
+        .on('db_place_piece', (payload: any) => {
+          const { grid: nextGrid, playerDecks: nextDecks, passedPlayers: nextPassed, currentTurn: nextTurn, gameState: nextGameState } = payload;
           setGrid(nextGrid);
           setPlayerDecks(nextDecks);
           setPassedPlayers(nextPassed);
@@ -723,8 +729,8 @@ export const BlokusApp: React.FC = () => {
             playSound('victory');
           }
         })
-        .on('broadcast', { event: 'db_pass' }, (payload: any) => {
-          const { passedPlayers: nextPassed, currentTurn: nextTurn, gameState: nextGameState } = payload.payload;
+        .on('db_pass', (payload: any) => {
+          const { passedPlayers: nextPassed, currentTurn: nextTurn, gameState: nextGameState } = payload;
           setPassedPlayers(nextPassed);
           setCurrentTurn(nextTurn);
           setGameState(nextGameState);
@@ -733,12 +739,18 @@ export const BlokusApp: React.FC = () => {
             playSound('victory');
           }
         })
-        .on('broadcast', { event: 'db_leave' }, () => {
+        .on('db_restart', (payload: any) => {
+          playSound('click');
+          initializeBoardState(payload.playerCount || config.playerCount);
+          setGameState('playing');
+        })
+        .on('db_leave', () => {
           setStatusText('Opponent left');
-          window.parent.postMessage({
-            type: 'WETALKS_NEW_MESSAGE',
-            payload: { sender: 'System', text: '対戦相手が退出しました。' }
-          }, '*');
+        })
+        .on('relay_member_left', () => {
+          if (gameStateRef.current === 'playing' || gameStateRef.current === 'gameover') {
+            setStatusText('Opponent left');
+          }
         });
 
       channel.subscribe((status: string) => {
@@ -748,8 +760,8 @@ export const BlokusApp: React.FC = () => {
             event: 'db_join',
             payload: { active: true },
           });
-          setStatusText('Synced! Awaiting host game initialization...');
-        } else {
+          setStatusText('Connected! Awaiting host game initialization...');
+        } else if (status === 'ERROR') {
           setErrorText('Could not connect');
         }
       });
@@ -761,8 +773,12 @@ export const BlokusApp: React.FC = () => {
   // Cleanup on leave
   useEffect(() => {
     return () => {
-      if (channelRef.current && supabaseRef.current) {
-        supabaseRef.current.removeChannel(channelRef.current);
+      if (channelRef.current) {
+        try {
+          channelRef.current.send({ type: 'broadcast', event: 'db_leave', payload: {} });
+          channelRef.current.unsubscribe();
+        } catch (e) {}
+        channelRef.current = null;
       }
     };
   }, []);
@@ -800,17 +816,23 @@ export const BlokusApp: React.FC = () => {
 
   const handleSelectSetup = () => {
     playSound('click');
+    setErrorText('');
+    setStatusText('');
     initializeBoardState(config.playerCount);
     setGameState('setup');
   };
 
   const handleReturnMenu = () => {
     playSound('click');
-    if (channelRef.current && supabaseRef.current) {
-      channelRef.current.send({ type: 'broadcast', event: 'db_leave', payload: {} });
-      supabaseRef.current.removeChannel(channelRef.current);
+    if (channelRef.current) {
+      try {
+        channelRef.current.send({ type: 'broadcast', event: 'db_leave', payload: {} });
+        channelRef.current.unsubscribe();
+      } catch (e) {}
     }
     channelRef.current = null;
+    setStatusText('');
+    setErrorText('');
     setGameState('menu');
   };
 
@@ -829,8 +851,10 @@ export const BlokusApp: React.FC = () => {
     }
   };
 
+  const displayDeckColor: PlayerColor = config.mode === 'online' ? onlinePlayerColor : currentTurn;
+
   const filteredTemplates = PIECE_TEMPLATES.filter((p) => {
-    const isAvailable = playerDecks[currentTurn]?.includes(p.id);
+    const isAvailable = playerDecks[displayDeckColor]?.includes(p.id);
     if (!isAvailable) return false;
 
     if (selectedSizeFilter === 'small') return p.size <= 3;
@@ -941,7 +965,7 @@ export const BlokusApp: React.FC = () => {
                   </div>
                   <div className="text-left">
                     <h3 className="text-sm font-extrabold text-white">Online Real-Time Sync</h3>
-                    <p className="text-[10px] text-zinc-400">Play cross-device using Supabase broadcast</p>
+                    <p className="text-[10px] text-zinc-400">Play cross-device using real-time room sync</p>
                   </div>
                 </div>
                 <Play className="w-4 h-4 text-zinc-500 group-hover:text-amber-400 transition-colors" />
@@ -1059,6 +1083,12 @@ export const BlokusApp: React.FC = () => {
                   </div>
                 )}
 
+                {statusText && (
+                  <div className="p-3 bg-indigo-950/30 border border-indigo-500/30 text-indigo-300 text-[11px] rounded-lg text-center font-medium">
+                    {statusText}
+                  </div>
+                )}
+
                 <div className="grid grid-cols-2 gap-3">
                   <button
                     onClick={handleCreateRoom}
@@ -1164,7 +1194,7 @@ export const BlokusApp: React.FC = () => {
                     YOUR DECK
                   </h3>
                   <span className="text-[10px] text-zinc-500 font-bold">
-                    {playerDecks[currentTurn]?.length || 0} Pieces left
+                    {playerDecks[displayDeckColor]?.length || 0} Pieces left
                   </span>
                 </div>
 
@@ -1213,7 +1243,7 @@ export const BlokusApp: React.FC = () => {
                                   key={idx}
                                   className={`aspect-square rounded-[1px] transition-all duration-100 ${
                                     isFilled 
-                                      ? COLOR_METADATA[currentTurn].bg 
+                                      ? COLOR_METADATA[displayDeckColor].bg 
                                       : 'bg-zinc-900/10'
                                   }`}
                                 />
@@ -1249,7 +1279,7 @@ export const BlokusApp: React.FC = () => {
                   </span>
                 </div>
                 <span className="text-[10px] text-zinc-400 font-bold uppercase">
-                  {config.mode === 'online' ? `Room: ${roomCode}` : 'Offline Mode'}
+                  {config.mode === 'online' ? (statusText && statusText.includes('disconnect') || statusText.includes('left') ? statusText : `Room: ${roomCode}`) : 'Offline Mode'}
                 </span>
               </div>
 
@@ -1409,6 +1439,13 @@ export const BlokusApp: React.FC = () => {
                       playSound('click');
                       initializeBoardState(config.playerCount);
                       setGameState('playing');
+                      if (config.mode === 'online' && channelRef.current) {
+                        channelRef.current.send({
+                          type: 'broadcast',
+                          event: 'db_restart',
+                          payload: { playerCount: config.playerCount },
+                        });
+                      }
                     }}
                     className="w-full py-3 bg-gradient-to-r from-indigo-600 to-rose-600 hover:from-indigo-500 hover:to-rose-500 text-white font-extrabold text-xs tracking-widest uppercase rounded-xl shadow-lg transition-all cursor-pointer"
                   >
