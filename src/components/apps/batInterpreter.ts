@@ -218,6 +218,10 @@ function expandVariables(
       case 'USERNAME': return username || 'User';
       case 'COMPUTERNAME': return 'ABORD-WEBOS';
       case 'OS': return 'Abord_WebOS';
+      case 'VER':
+      case 'OS_VERSION':
+      case 'WEBOS_VERSION':
+        return 'web-os-ver2027.05r';
       case 'RANDOM': return String(Math.floor(Math.random() * 32768));
       case 'ERRORLEVEL': return String(errorLevel);
       case 'ABOAD_URL': return localStorage.getItem('aboad_git_url') || 'https://moozunobu.github.io/Abord-browser-ver2/';

@@ -43,6 +43,7 @@ import {
   tursoMarkMessagesRead,
   tursoPollCallSignals,
   tursoProbeCallParticipants,
+  tursoProbeMaxTimestamps,
   tursoPruneExpiredImages,
   tursoRegisterUser,
   tursoRelayJoin,
@@ -52,6 +53,7 @@ import {
   tursoRenameUser,
   tursoSendCallSignal,
   tursoSyncPresence,
+  tursoSyncSnapshot,
   tursoUpdateAvatar,
   tursoUpdateCallMedia,
 } from './server/turso';
@@ -1183,6 +1185,7 @@ app.get('/api/wetalks/messages/:roomId', async (req, res) => {
     const { roomId } = req.params;
     const markRead = req.query.markRead === '1' || req.query.markRead === 'true';
     const isSummary = req.query.summary === '1' || req.query.summary === 'true';
+    const after = String(req.query.after || '').trim();
 
     if (hasTursoConfig()) {
       const authUser = await tursoGetUserByToken(getRequestToken(req));
@@ -1199,7 +1202,7 @@ app.get('/api/wetalks/messages/:roomId', async (req, res) => {
           broadcastWetalksEvent('read', roomId);
         }
       }
-      const msgs = await tursoGetMessagesForRoom(roomId, { summary: isSummary });
+      const msgs = await tursoGetMessagesForRoom(roomId, { summary: isSummary, after });
       return res.json(msgs);
     }
 
@@ -1218,8 +1221,8 @@ app.get('/api/wetalks/messages/:roomId', async (req, res) => {
         broadcastWetalksEvent('read', roomId);
       }
     }
-    let filtered = db.messages.filter(m => m.room_id === roomId);
-    if (isSummary && filtered.length > 30) {
+    let filtered = db.messages.filter(m => m.room_id === roomId && (!after || String(m.created_at || '') > after));
+    if (isSummary && !after && filtered.length > 30) {
       filtered = filtered.slice(-30);
     }
     const msgs = filtered.map(m => {
@@ -1351,6 +1354,146 @@ app.post('/api/wetalks/messages', async (req, res) => {
     return res.json({ success: true, message: newMsg });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || 'メッセージ送信に失敗しました。' });
+  }
+});
+
+app.get('/api/wetalks/sync', async (req, res) => {
+  try {
+    const after = String(req.query.after || '').trim();
+    const roomId = String(req.query.roomId || '').trim();
+    const roomAfter = String(req.query.roomAfter || '').trim();
+    const broadcastAfter = String(req.query.broadcastAfter || '').trim();
+    const includeRooms = req.query.includeRooms === '1';
+    const waitMs = Math.min(Math.max(Number(req.query.waitMs || 0) || 0, 0), 8000);
+    const token = getRequestToken(req);
+
+    if (hasTursoConfig()) {
+      let snapshot = await tursoSyncSnapshot({ token, after, roomId, roomAfter, broadcastAfter, includeRooms });
+      const hasInitial =
+        snapshot.broadcasts.length > 0 ||
+        snapshot.messages.length > 0 ||
+        snapshot.roomMessages.length > 0;
+
+      if (!hasInitial && waitMs > 0 && (after || broadcastAfter || roomAfter)) {
+        const deadline = Date.now() + waitMs;
+        let closed = false;
+        req.on('close', () => {
+          closed = true;
+        });
+        while (!closed && Date.now() < deadline) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 20) break;
+          const woke = await waitExpressSyncWakeup(Math.min(350, remaining), roomId);
+          if (closed) break;
+          if (woke) {
+            snapshot = await tursoSyncSnapshot({ token, after, roomId, roomAfter, broadcastAfter, includeRooms });
+            if (
+              woke.kind === 'read' ||
+              snapshot.broadcasts.length > 0 ||
+              snapshot.messages.length > 0 ||
+              snapshot.roomMessages.length > 0
+            ) {
+              break;
+            }
+            continue;
+          }
+          const probe = await tursoProbeMaxTimestamps();
+          if (
+            (after && probe.latestMsgAt > after) ||
+            (roomAfter && probe.latestMsgAt > roomAfter) ||
+            (broadcastAfter && probe.latestBroadcastAt > broadcastAfter)
+          ) {
+            snapshot = await tursoSyncSnapshot({ token, after, roomId, roomAfter, broadcastAfter, includeRooms });
+            break;
+          }
+        }
+      }
+
+      return res.json({
+        success: true,
+        serverTime: new Date().toISOString(),
+        latestMsgAt: snapshot.latestMsgAt,
+        latestBroadcastAt: snapshot.latestBroadcastAt,
+        messages: snapshot.messages,
+        roomMessages: snapshot.roomMessages,
+        readUpdates: snapshot.readUpdates,
+        broadcasts: snapshot.broadcasts,
+        ...(snapshot.rooms ? { rooms: snapshot.rooms } : {}),
+      });
+    }
+
+    // Local JSON DB mode
+    const buildLocalSnapshot = () => {
+      const db = readWeTalksDB();
+      const authUser = token ? db.users.find(u => u.token && u.token === token) || null : null;
+      const broadcastsAll = readBroadcasts();
+      const latestBroadcastAt = broadcastsAll.length > 0 ? String(broadcastsAll[broadcastsAll.length - 1]?.timestamp || '') : '';
+      const latestMsgAt = db.messages.length > 0
+        ? db.messages.reduce((max, m) => (String(m.created_at || '') > max ? String(m.created_at || '') : max), '')
+        : '';
+      const broadcasts = broadcastAfter
+        ? broadcastsAll.filter(b => String(b.timestamp || '') > broadcastAfter)
+        : broadcastsAll;
+
+      const myRooms = authUser ? db.rooms.filter(r => isUserMemberOfRoom(r, authUser.username)) : [];
+      const allowedSet = new Set(myRooms.map(r => r.id));
+
+      const messages = authUser && after
+        ? db.messages
+            .filter(m => String(m.created_at || '') > after && allowedSet.has(m.room_id))
+            .slice(-60)
+            .map(m => ({
+              id: m.id,
+              room_id: m.room_id,
+              sender: m.sender,
+              text: m.text || '',
+              has_image: Boolean(m.image_base64),
+              read_by: Array.isArray(m.read_by) ? m.read_by.filter(u => u && u !== m.sender) : [],
+              created_at: m.created_at,
+            }))
+        : [];
+
+      const roomMessages = authUser && roomId && roomAfter && allowedSet.has(roomId)
+        ? db.messages.filter(m => m.room_id === roomId && String(m.created_at || '') > roomAfter).slice(-80)
+        : [];
+
+      const readUpdates = authUser && roomId && allowedSet.has(roomId)
+        ? db.messages
+            .filter(m => m.room_id === roomId)
+            .slice(-25)
+            .map(m => ({
+              id: m.id,
+              read_by: Array.isArray(m.read_by) ? m.read_by.filter(u => u && u !== m.sender) : [],
+            }))
+        : [];
+
+      return {
+        latestMsgAt,
+        latestBroadcastAt,
+        messages,
+        roomMessages,
+        readUpdates,
+        broadcasts,
+        ...(includeRooms && authUser ? { rooms: myRooms } : {}),
+      };
+    };
+
+    let snap = buildLocalSnapshot();
+    const hasInitial = snap.broadcasts.length > 0 || snap.messages.length > 0 || snap.roomMessages.length > 0;
+    if (!hasInitial && waitMs > 0 && (after || broadcastAfter || roomAfter)) {
+      const woke = await waitExpressSyncWakeup(waitMs, roomId);
+      if (woke) {
+        snap = buildLocalSnapshot();
+      }
+    }
+
+    return res.json({
+      success: true,
+      serverTime: new Date().toISOString(),
+      ...snap,
+    });
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'Sync error' });
   }
 });
 
@@ -2472,7 +2615,43 @@ interface WeTalksEventMeta {
   members?: string[];
 }
 
+type SyncWaiter = (evt: { kind: string; roomId: string }) => void;
+const expressSyncWaiters = new Set<SyncWaiter>();
+
+function notifyExpressSyncWaiters(kind: string, roomId = '') {
+  for (const w of Array.from(expressSyncWaiters)) {
+    try {
+      w({ kind, roomId });
+    } catch {}
+  }
+}
+
+function waitExpressSyncWakeup(ms: number, targetRoomId = ''): Promise<{ kind: string; roomId: string } | null> {
+  if (ms <= 0) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let settled = false;
+    const onEvent: SyncWaiter = (evt) => {
+      if (settled) return;
+      if (evt.kind === 'read' && targetRoomId && evt.roomId && evt.roomId !== targetRoomId) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      expressSyncWaiters.delete(onEvent);
+      resolve(evt);
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      expressSyncWaiters.delete(onEvent);
+      resolve(null);
+    }, ms);
+    expressSyncWaiters.add(onEvent);
+  });
+}
+
 function broadcastWetalksEvent(event: 'read' | 'message', roomId: string, meta?: WeTalksEventMeta) {
+  notifyExpressSyncWaiters(event, roomId);
   if (!roomId || wetalksWsClients.size === 0) return;
   const membersList = Array.isArray(meta?.members) && meta.members.length > 0 ? meta.members : null;
   const memberSet = membersList ? new Set(membersList) : null;
@@ -3562,7 +3741,8 @@ app.post('/api/admin/broadcasts', async (req, res) => {
       writeBroadcasts(broadcasts);
     }
 
-    // Broadcast to all active WebSocket clients immediately
+    // Broadcast to all active WebSocket clients & long-poll sync waiters immediately
+    notifyExpressSyncWaiters('broadcast', '*');
     broadcastAllWs({
       type: 'admin_broadcast',
       broadcast: newBroadcast

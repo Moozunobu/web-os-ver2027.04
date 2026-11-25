@@ -331,17 +331,19 @@ async function ensureTursoSchema(env) {
   if (tursoSchemaPromise) return tursoSchemaPromise;
   tursoSchemaPromise = (async () => {
     await tursoBatch(env, [
-      { sql: 'CREATE TABLE IF NOT EXISTS wetalks_users (username TEXT PRIMARY KEY, password_numeric TEXT NOT NULL DEFAULT "", password_hash TEXT DEFAULT "", token TEXT DEFAULT "", avatar_base64 TEXT DEFAULT "")' },
-      { sql: 'CREATE TABLE IF NOT EXISTS wetalks_rooms (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, members_json TEXT DEFAULT "", created_by TEXT DEFAULT "")' },
-      { sql: 'CREATE TABLE IF NOT EXISTS wetalks_messages (id TEXT PRIMARY KEY, room_id TEXT NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, image_base64 TEXT DEFAULT "", reply_to_json TEXT DEFAULT "", read_by_json TEXT DEFAULT "", created_at TEXT NOT NULL)' },
-      { sql: 'CREATE TABLE IF NOT EXISTS wetalks_deleted_rooms (id TEXT PRIMARY KEY)' },
-      { sql: 'CREATE TABLE IF NOT EXISTS wetalks_presence (client_id TEXT PRIMARY KEY, username TEXT NOT NULL, room_id TEXT DEFAULT "", last_seen INTEGER NOT NULL)' },
-      { sql: 'CREATE TABLE IF NOT EXISTS wetalks_call_participants (room_id TEXT NOT NULL, peer_id TEXT NOT NULL, username TEXT NOT NULL, cam_on INTEGER NOT NULL DEFAULT 1, mic_on INTEGER NOT NULL DEFAULT 0, last_seen INTEGER NOT NULL, PRIMARY KEY (room_id, peer_id))' },
-      { sql: 'CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCREMENT, room_id TEXT NOT NULL, from_peer_id TEXT NOT NULL, target_peer_id TEXT NOT NULL, signal_type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at INTEGER NOT NULL)' },
-      { sql: 'CREATE TABLE IF NOT EXISTS admin_broadcasts (id TEXT PRIMARY KEY, sender TEXT NOT NULL, title TEXT NOT NULL, text TEXT NOT NULL, timestamp TEXT NOT NULL, kind TEXT DEFAULT "docx", bat_filename TEXT DEFAULT "", bat_code TEXT DEFAULT "", auto_run INTEGER DEFAULT 0, target_user TEXT DEFAULT "*", sender_client_id TEXT DEFAULT "")' },
-      { sql: 'CREATE TABLE IF NOT EXISTS game_relay_members (channel TEXT NOT NULL, member_id TEXT NOT NULL, username TEXT DEFAULT "", last_seen INTEGER NOT NULL, PRIMARY KEY (channel, member_id))' },
-      { sql: 'CREATE TABLE IF NOT EXISTS game_relay_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, member_id TEXT NOT NULL, username TEXT DEFAULT "", event TEXT NOT NULL, payload_json TEXT NOT NULL, include_self INTEGER DEFAULT 0, created_at INTEGER NOT NULL)' },
+      { sql: `CREATE TABLE IF NOT EXISTS wetalks_users (username TEXT PRIMARY KEY, password_numeric TEXT NOT NULL DEFAULT '', password_hash TEXT DEFAULT '', token TEXT DEFAULT '', avatar_base64 TEXT DEFAULT '')` },
+      { sql: `CREATE TABLE IF NOT EXISTS wetalks_rooms (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, members_json TEXT DEFAULT '', created_by TEXT DEFAULT '')` },
+      { sql: `CREATE TABLE IF NOT EXISTS wetalks_messages (id TEXT PRIMARY KEY, room_id TEXT NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, image_base64 TEXT DEFAULT '', reply_to_json TEXT DEFAULT '', read_by_json TEXT DEFAULT '', created_at TEXT NOT NULL)` },
+      { sql: `CREATE TABLE IF NOT EXISTS wetalks_deleted_rooms (id TEXT PRIMARY KEY)` },
+      { sql: `CREATE TABLE IF NOT EXISTS wetalks_presence (client_id TEXT PRIMARY KEY, username TEXT NOT NULL, room_id TEXT DEFAULT '', last_seen INTEGER NOT NULL)` },
+      { sql: `CREATE TABLE IF NOT EXISTS wetalks_call_participants (room_id TEXT NOT NULL, peer_id TEXT NOT NULL, username TEXT NOT NULL, cam_on INTEGER NOT NULL DEFAULT 1, mic_on INTEGER NOT NULL DEFAULT 0, last_seen INTEGER NOT NULL, PRIMARY KEY (room_id, peer_id))` },
+      { sql: `CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCREMENT, room_id TEXT NOT NULL, from_peer_id TEXT NOT NULL, target_peer_id TEXT NOT NULL, signal_type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at INTEGER NOT NULL)` },
+      { sql: `CREATE TABLE IF NOT EXISTS admin_broadcasts (id TEXT PRIMARY KEY, sender TEXT NOT NULL, title TEXT NOT NULL, text TEXT NOT NULL, timestamp TEXT NOT NULL, kind TEXT DEFAULT 'docx', bat_filename TEXT DEFAULT '', bat_code TEXT DEFAULT '', auto_run INTEGER DEFAULT 0, target_user TEXT DEFAULT '*', sender_client_id TEXT DEFAULT '')` },
+      { sql: `CREATE TABLE IF NOT EXISTS game_relay_members (channel TEXT NOT NULL, member_id TEXT NOT NULL, username TEXT DEFAULT '', last_seen INTEGER NOT NULL, PRIMARY KEY (channel, member_id))` },
+      { sql: `CREATE TABLE IF NOT EXISTS game_relay_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, member_id TEXT NOT NULL, username TEXT DEFAULT '', event TEXT NOT NULL, payload_json TEXT NOT NULL, include_self INTEGER DEFAULT 0, created_at INTEGER NOT NULL)` },
       { sql: 'CREATE INDEX IF NOT EXISTS idx_messages_room_created ON wetalks_messages(room_id, created_at)' },
+      { sql: 'CREATE INDEX IF NOT EXISTS idx_messages_created_at ON wetalks_messages(created_at)' },
+      { sql: 'CREATE INDEX IF NOT EXISTS idx_broadcasts_timestamp ON admin_broadcasts(timestamp)' },
       { sql: 'CREATE INDEX IF NOT EXISTS idx_users_token ON wetalks_users(token)' },
       { sql: 'CREATE INDEX IF NOT EXISTS idx_presence_last_seen ON wetalks_presence(last_seen)' },
       { sql: 'CREATE INDEX IF NOT EXISTS idx_call_participants_room_seen ON wetalks_call_participants(room_id, last_seen)' },
@@ -353,6 +355,40 @@ async function ensureTursoSchema(env) {
     tursoSchemaPromise = null;
   });
   return tursoSchemaPromise;
+}
+
+const syncWaiters = new Set();
+
+function notifySyncWaiters(kind, roomId = '') {
+  for (const w of Array.from(syncWaiters)) {
+    try {
+      w({ kind, roomId });
+    } catch {}
+  }
+}
+
+function waitForSyncWakeup(ms, targetRoomId = '') {
+  if (ms <= 0) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let settled = false;
+    const onEvent = (evt) => {
+      if (settled) return;
+      if (evt && evt.kind === 'read' && targetRoomId && evt.roomId && evt.roomId !== targetRoomId) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      syncWaiters.delete(onEvent);
+      resolve(evt || { kind: 'wakeup' });
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      syncWaiters.delete(onEvent);
+      resolve(null);
+    }, ms);
+    syncWaiters.add(onEvent);
+  });
 }
 
 async function tursoImportBundle(env, bundle) {
@@ -463,16 +499,16 @@ let d1SchemaReady = false;
 async function ensureD1Schema(db) {
   if (!db || d1SchemaReady) return;
   const stmts = [
-    'CREATE TABLE IF NOT EXISTS wetalks_users (username TEXT PRIMARY KEY, password_numeric TEXT NOT NULL DEFAULT "", password_hash TEXT DEFAULT "", token TEXT DEFAULT "", avatar_base64 TEXT DEFAULT "")',
-    'CREATE TABLE IF NOT EXISTS wetalks_rooms (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, members_json TEXT DEFAULT "", created_by TEXT DEFAULT "")',
-    'CREATE TABLE IF NOT EXISTS wetalks_messages (id TEXT PRIMARY KEY, room_id TEXT NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, image_base64 TEXT DEFAULT "", reply_to_json TEXT DEFAULT "", read_by_json TEXT DEFAULT "", created_at TEXT NOT NULL)',
-    'CREATE TABLE IF NOT EXISTS wetalks_deleted_rooms (id TEXT PRIMARY KEY)',
-    'CREATE TABLE IF NOT EXISTS wetalks_presence (client_id TEXT PRIMARY KEY, username TEXT NOT NULL, room_id TEXT DEFAULT "", last_seen INTEGER NOT NULL)',
-    'CREATE TABLE IF NOT EXISTS wetalks_call_participants (room_id TEXT NOT NULL, peer_id TEXT NOT NULL, username TEXT NOT NULL, cam_on INTEGER NOT NULL DEFAULT 1, mic_on INTEGER NOT NULL DEFAULT 0, last_seen INTEGER NOT NULL, PRIMARY KEY (room_id, peer_id))',
-    'CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCREMENT, room_id TEXT NOT NULL, from_peer_id TEXT NOT NULL, target_peer_id TEXT NOT NULL, signal_type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at INTEGER NOT NULL)',
-    'CREATE TABLE IF NOT EXISTS admin_broadcasts (id TEXT PRIMARY KEY, sender TEXT NOT NULL, title TEXT NOT NULL, text TEXT NOT NULL, timestamp TEXT NOT NULL, kind TEXT DEFAULT "docx", bat_filename TEXT DEFAULT "", bat_code TEXT DEFAULT "", auto_run INTEGER DEFAULT 0, target_user TEXT DEFAULT "*", sender_client_id TEXT DEFAULT "")',
-    'CREATE TABLE IF NOT EXISTS game_relay_members (channel TEXT NOT NULL, member_id TEXT NOT NULL, username TEXT DEFAULT "", last_seen INTEGER NOT NULL, PRIMARY KEY (channel, member_id))',
-    'CREATE TABLE IF NOT EXISTS game_relay_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, member_id TEXT NOT NULL, username TEXT DEFAULT "", event TEXT NOT NULL, payload_json TEXT NOT NULL, include_self INTEGER DEFAULT 0, created_at INTEGER NOT NULL)',
+    `CREATE TABLE IF NOT EXISTS wetalks_users (username TEXT PRIMARY KEY, password_numeric TEXT NOT NULL DEFAULT '', password_hash TEXT DEFAULT '', token TEXT DEFAULT '', avatar_base64 TEXT DEFAULT '')`,
+    `CREATE TABLE IF NOT EXISTS wetalks_rooms (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, members_json TEXT DEFAULT '', created_by TEXT DEFAULT '')`,
+    `CREATE TABLE IF NOT EXISTS wetalks_messages (id TEXT PRIMARY KEY, room_id TEXT NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, image_base64 TEXT DEFAULT '', reply_to_json TEXT DEFAULT '', read_by_json TEXT DEFAULT '', created_at TEXT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS wetalks_deleted_rooms (id TEXT PRIMARY KEY)`,
+    `CREATE TABLE IF NOT EXISTS wetalks_presence (client_id TEXT PRIMARY KEY, username TEXT NOT NULL, room_id TEXT DEFAULT '', last_seen INTEGER NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS wetalks_call_participants (room_id TEXT NOT NULL, peer_id TEXT NOT NULL, username TEXT NOT NULL, cam_on INTEGER NOT NULL DEFAULT 1, mic_on INTEGER NOT NULL DEFAULT 0, last_seen INTEGER NOT NULL, PRIMARY KEY (room_id, peer_id))`,
+    `CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCREMENT, room_id TEXT NOT NULL, from_peer_id TEXT NOT NULL, target_peer_id TEXT NOT NULL, signal_type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at INTEGER NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS admin_broadcasts (id TEXT PRIMARY KEY, sender TEXT NOT NULL, title TEXT NOT NULL, text TEXT NOT NULL, timestamp TEXT NOT NULL, kind TEXT DEFAULT 'docx', bat_filename TEXT DEFAULT '', bat_code TEXT DEFAULT '', auto_run INTEGER DEFAULT 0, target_user TEXT DEFAULT '*', sender_client_id TEXT DEFAULT '')`,
+    `CREATE TABLE IF NOT EXISTS game_relay_members (channel TEXT NOT NULL, member_id TEXT NOT NULL, username TEXT DEFAULT '', last_seen INTEGER NOT NULL, PRIMARY KEY (channel, member_id))`,
+    `CREATE TABLE IF NOT EXISTS game_relay_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, member_id TEXT NOT NULL, username TEXT DEFAULT '', event TEXT NOT NULL, payload_json TEXT NOT NULL, include_self INTEGER DEFAULT 0, created_at INTEGER NOT NULL)`,
   ];
   let allCreateOk = true;
   for (const sql of stmts) {
@@ -493,7 +529,7 @@ async function markMessagesAsRead(env, roomId, readerUsername) {
     await ensureTursoSchema(env);
     const res = await tursoExecute(
       env,
-      'SELECT id, sender, read_by_json FROM wetalks_messages WHERE room_id = ? AND sender != ?',
+      'SELECT id, sender, read_by_json FROM wetalks_messages WHERE room_id = ? AND sender != ? ORDER BY created_at DESC LIMIT 60',
       [roomId, readerUsername]
     );
     const updates = [];
@@ -510,7 +546,10 @@ async function markMessagesAsRead(env, roomId, readerUsername) {
         });
       }
     }
-    if (updates.length > 0) await tursoBatch(env, updates);
+    if (updates.length > 0) {
+      await tursoBatch(env, updates);
+      notifySyncWaiters('read', roomId);
+    }
     return updates.length;
   }
 
@@ -600,7 +639,7 @@ async function pruneExpiredImages(env, specificRoomId = null, force = false) {
     try {
       const res = await tursoExecute(
         env,
-        'UPDATE wetalks_messages SET image_base64 = "", text = CASE WHEN TRIM(text) = "" THEN "🖼️ 10日経過により画像は自動削除されました" ELSE text END WHERE image_base64 IS NOT NULL AND image_base64 != "" AND created_at <= ?',
+        `UPDATE wetalks_messages SET image_base64 = '', text = CASE WHEN TRIM(text) = '' THEN '🖼️ 10日経過により画像は自動削除されました' ELSE text END WHERE image_base64 IS NOT NULL AND image_base64 != '' AND created_at <= ?`,
         [cutoffIso]
       );
       pruned = res.rowsAffected || 0;
@@ -612,7 +651,7 @@ async function pruneExpiredImages(env, specificRoomId = null, force = false) {
     await ensureD1Schema(env.DB);
     try {
       const res = await env.DB.prepare(
-        'UPDATE wetalks_messages SET image_base64 = "", text = CASE WHEN TRIM(text) = "" THEN "🖼️ 10日経過により画像は自動削除されました" ELSE text END WHERE image_base64 IS NOT NULL AND image_base64 != "" AND created_at <= ?'
+        `UPDATE wetalks_messages SET image_base64 = '', text = CASE WHEN TRIM(text) = '' THEN '🖼️ 10日経過により画像は自動削除されました' ELSE text END WHERE image_base64 IS NOT NULL AND image_base64 != '' AND created_at <= ?`
       ).bind(cutoffIso).run();
       pruned = res && res.meta && res.meta.changes ? res.meta.changes : 0;
     } catch {}
@@ -898,7 +937,7 @@ export default {
             { sql: 'UPDATE wetalks_users SET username = ? WHERE username = ?', args: [newTrimmed, oldName] },
             { sql: 'UPDATE wetalks_messages SET sender = ? WHERE sender = ?', args: [newTrimmed, oldName] },
             { sql: 'SELECT id, name, type, members_json, created_by FROM wetalks_rooms' },
-            { sql: 'SELECT id, sender, reply_to_json, read_by_json FROM wetalks_messages WHERE (reply_to_json IS NOT NULL AND reply_to_json != "") OR (read_by_json IS NOT NULL AND read_by_json != "")' },
+            { sql: `SELECT id, sender, reply_to_json, read_by_json FROM wetalks_messages WHERE (reply_to_json IS NOT NULL AND reply_to_json != '') OR (read_by_json IS NOT NULL AND read_by_json != '')` },
           ]);
           const updates = [];
           for (const r of roomsRes.rows) {
@@ -1169,7 +1208,7 @@ export default {
           await ensureTursoSchema(env);
           await tursoExecute(env, 'DELETE FROM wetalks_deleted_rooms WHERE id = ?', [id]);
           if (type === 'direct') {
-            const directs = await tursoExecute(env, 'SELECT id, name, type, members_json, created_by FROM wetalks_rooms WHERE type = "direct"');
+            const directs = await tursoExecute(env, `SELECT id, name, type, members_json, created_by FROM wetalks_rooms WHERE type = 'direct'`);
             const dup = directs.rows.map(serializeRoomRow).find((r) => r && ((r.members.includes(finalMembers[0]) && r.members.includes(finalMembers[1])) || r.name === roomName));
             if (dup) return jsonResponse({ success: true, room: dup });
           }
@@ -1184,13 +1223,14 @@ export default {
             'INSERT INTO wetalks_rooms (id, name, type, members_json, created_by) VALUES (?, ?, ?, ?, ?)',
             [id, roomName, type, JSON.stringify(finalMembers), authUser.username]
           );
+          notifySyncWaiters('room', id);
           return jsonResponse({ success: true, room: { id, name: roomName, type, members: finalMembers, created_by: authUser.username } });
         }
         if (env.DB) {
           await ensureD1Schema(env.DB);
           try { await env.DB.prepare('DELETE FROM wetalks_deleted_rooms WHERE id = ?').bind(id).run(); } catch {}
           if (type === 'direct') {
-            const { results: existingDirects } = await env.DB.prepare('SELECT id, name, type, members_json, created_by FROM wetalks_rooms WHERE type = "direct"').all();
+            const { results: existingDirects } = await env.DB.prepare(`SELECT id, name, type, members_json, created_by FROM wetalks_rooms WHERE type = 'direct'`).all();
             const dup = (existingDirects || []).map(serializeRoomRow).find((r) => r && ((r.members.includes(finalMembers[0]) && r.members.includes(finalMembers[1])) || r.name === roomName));
             if (dup) return jsonResponse({ success: true, room: dup });
           }
@@ -1254,6 +1294,7 @@ export default {
           });
           room.members = Array.from(memberSet);
           await tursoExecute(env, 'UPDATE wetalks_rooms SET members_json = ? WHERE id = ?', [JSON.stringify(room.members), roomId]);
+          notifySyncWaiters('room', roomId);
           return jsonResponse({ success: true, room, addedMembers });
         }
         if (env.DB) {
@@ -1275,6 +1316,7 @@ export default {
           });
           room.members = Array.from(memberSet);
           await env.DB.prepare('UPDATE wetalks_rooms SET members_json = ? WHERE id = ?').bind(JSON.stringify(room.members), roomId).run();
+          notifySyncWaiters('room', roomId);
           return jsonResponse({ success: true, room, addedMembers });
         }
         return errorResponse('Turso または D1/KV が設定されていません。', 503);
@@ -1292,6 +1334,7 @@ export default {
             { sql: 'DELETE FROM wetalks_call_participants WHERE room_id = ?', args: [roomId] },
             { sql: 'DELETE FROM wetalks_call_signals WHERE room_id = ?', args: [roomId] },
           ]);
+          notifySyncWaiters('room', roomId);
           return jsonResponse({ success: true });
         }
         if (env.DB) {
@@ -1336,6 +1379,7 @@ export default {
           }
         }
         const updatedCount = await markMessagesAsRead(env, roomId, authUser.username);
+        if (updatedCount > 0) notifySyncWaiters('read', roomId);
         return jsonResponse({ success: true, updatedCount });
       }
 
@@ -1346,22 +1390,30 @@ export default {
         if (!authUser) return errorResponse('ログインが必要です。', 401);
         const markRead = url.searchParams.get('markRead') === '1' || url.searchParams.get('markRead') === 'true';
         const isSummary = url.searchParams.get('summary') === '1' || url.searchParams.get('summary') === 'true';
+        const after = String(url.searchParams.get('after') || '').trim();
         await pruneExpiredImages(env, roomId, false);
 
         if (usingTurso) {
           await ensureTursoSchema(env);
-          const roomRes = await tursoExecute(env, 'SELECT id, name, type, members_json, created_by FROM wetalks_rooms WHERE id = ? LIMIT 1', [roomId]);
+          if (markRead) await markMessagesAsRead(env, roomId, authUser.username);
+          const msgSql = isSummary
+            ? (after
+                ? `SELECT id, room_id, sender, text, (CASE WHEN image_base64 IS NOT NULL AND image_base64 != '' THEN 1 ELSE 0 END) AS has_image, read_by_json, created_at FROM wetalks_messages WHERE room_id = ? AND created_at > ? ORDER BY created_at ASC LIMIT 60`
+                : `SELECT id, room_id, sender, text, (CASE WHEN image_base64 IS NOT NULL AND image_base64 != '' THEN 1 ELSE 0 END) AS has_image, read_by_json, created_at FROM wetalks_messages WHERE room_id = ? ORDER BY created_at DESC LIMIT 30`)
+            : (after
+                ? 'SELECT id, room_id, sender, text, image_base64, reply_to_json, read_by_json, created_at FROM wetalks_messages WHERE room_id = ? AND created_at > ? ORDER BY created_at ASC LIMIT 100'
+                : 'SELECT id, room_id, sender, text, image_base64, reply_to_json, read_by_json, created_at FROM wetalks_messages WHERE room_id = ? ORDER BY created_at ASC LIMIT 200');
+          const msgArgs = after ? [roomId, after] : [roomId];
+          const [roomRes, msgRes] = await tursoBatch(env, [
+            { sql: 'SELECT id, name, type, members_json, created_by FROM wetalks_rooms WHERE id = ? LIMIT 1', args: [roomId] },
+            { sql: msgSql, args: msgArgs },
+          ]);
           if (roomRes.rows[0] && !isUserMemberOfRoom(serializeRoomRow(roomRes.rows[0]), authUser.username)) {
             return errorResponse('このトークルームを閲覧する権限がありません。', 403);
           }
-          if (markRead) await markMessagesAsRead(env, roomId, authUser.username);
           if (isSummary) {
-            const sumRes = await tursoExecute(
-              env,
-              'SELECT id, room_id, sender, text, (CASE WHEN image_base64 IS NOT NULL AND image_base64 != "" THEN 1 ELSE 0 END) AS has_image, read_by_json, created_at FROM wetalks_messages WHERE room_id = ? ORDER BY created_at DESC LIMIT 30',
-              [roomId]
-            );
-            return jsonResponse(sumRes.rows.slice().reverse().map((m) => {
+            const rows = after ? msgRes.rows : msgRes.rows.slice().reverse();
+            return jsonResponse(rows.map((m) => {
               const parsedRead = parseJsonSafe(m.read_by_json, []);
               const cleanReadBy = Array.isArray(parsedRead)
                 ? Array.from(new Set(parsedRead.map((u) => String(u || '').trim()).filter((u) => u && u !== 'ゲスト' && u !== m.sender)))
@@ -1377,12 +1429,7 @@ export default {
               };
             }));
           }
-          const msgsRes = await tursoExecute(
-            env,
-            'SELECT id, room_id, sender, text, image_base64, reply_to_json, read_by_json, created_at FROM wetalks_messages WHERE room_id = ? ORDER BY created_at ASC LIMIT 200',
-            [roomId]
-          );
-          return jsonResponse(msgsRes.rows.map(serializeMessageRow));
+          return jsonResponse(msgRes.rows.map(serializeMessageRow));
         }
 
         if (env.DB) {
@@ -1462,6 +1509,7 @@ export default {
             'INSERT OR IGNORE INTO wetalks_messages (id, room_id, sender, text, image_base64, reply_to_json, read_by_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             [newMsg.id, newMsg.room_id, newMsg.sender, newMsg.text, newMsg.image_base64, cleanReply ? JSON.stringify(cleanReply) : '', '[]', newMsg.created_at]
           );
+          notifySyncWaiters('message', newMsg.room_id);
           return jsonResponse({ success: true, message: newMsg });
         }
         if (env.DB) {
@@ -1472,6 +1520,7 @@ export default {
           }
           await env.DB.prepare('INSERT OR IGNORE INTO wetalks_messages (id, room_id, sender, text, image_base64, reply_to_json, read_by_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
             .bind(newMsg.id, newMsg.room_id, newMsg.sender, newMsg.text, newMsg.image_base64, cleanReply ? JSON.stringify(cleanReply) : '', '[]', newMsg.created_at).run();
+          notifySyncWaiters('message', newMsg.room_id);
           return jsonResponse({ success: true, message: newMsg });
         }
         if (env.WETALKS_KV) {
@@ -1486,9 +1535,201 @@ export default {
             if (msgs.length > 300) msgs = msgs.slice(-300);
             await env.WETALKS_KV.put(`messages:${room_id}`, JSON.stringify(msgs));
           }
+          notifySyncWaiters('message', newMsg.room_id);
           return jsonResponse({ success: true, message: newMsg });
         }
         return errorResponse('Turso または D1/KV が設定されていません。', 503);
+      }
+
+      // 9a. GET /api/wetalks/sync (Unified ultra-fast long-poll + delta sync for chat & broadcasts)
+      if (path === '/api/wetalks/sync' && request.method === 'GET') {
+        const after = String(url.searchParams.get('after') || '').trim();
+        const roomId = String(url.searchParams.get('roomId') || '').trim();
+        const roomAfter = String(url.searchParams.get('roomAfter') || '').trim();
+        const broadcastAfter = String(url.searchParams.get('broadcastAfter') || '').trim();
+        const includeRooms = url.searchParams.get('includeRooms') === '1';
+        const waitMs = Math.min(Math.max(Number(url.searchParams.get('waitMs') || 0) || 0, 0), 3200);
+        const token = getRequestToken(request, null);
+
+        const formatBroadcastRow = (r) => ({
+          id: String(r.id),
+          sender: String(r.sender),
+          title: String(r.title),
+          text: String(r.text),
+          timestamp: String(r.timestamp),
+          kind: r.kind === 'bat' ? 'bat' : 'docx',
+          ...(r.bat_filename ? { batFilename: String(r.bat_filename) } : {}),
+          ...(r.bat_code ? { batCode: String(r.bat_code) } : {}),
+          ...(r.auto_run ? { autoRun: true } : {}),
+          ...(r.target_user ? { targetUser: String(r.target_user) } : {}),
+          ...(r.sender_client_id ? { senderClientId: String(r.sender_client_id) } : {}),
+        });
+
+        const serializeSummaryMsg = (m) => {
+          const parsedRead = parseJsonSafe(m.read_by_json, []);
+          const cleanReadBy = Array.isArray(parsedRead)
+            ? Array.from(new Set(parsedRead.map((u) => String(u || '').trim()).filter((u) => u && u !== 'ゲスト' && u !== m.sender)))
+            : [];
+          return {
+            id: m.id,
+            room_id: m.room_id,
+            sender: m.sender,
+            text: m.text || '',
+            has_image: Boolean(m.has_image || m.image_base64),
+            read_by: cleanReadBy,
+            created_at: m.created_at,
+          };
+        };
+
+        if (usingTurso) {
+          await ensureTursoSchema(env);
+
+          const runSyncFetch = async () => {
+            const ops = [
+              { sql: 'SELECT MAX(created_at) AS max_msg_at FROM wetalks_messages' },
+              { sql: 'SELECT MAX(timestamp) AS max_bc_at FROM admin_broadcasts' },
+            ];
+            const idxAuth = token ? ops.push({ sql: 'SELECT username FROM wetalks_users WHERE token = ? LIMIT 1', args: [token] }) - 1 : -1;
+            const idxBc = ops.push(
+              broadcastAfter
+                ? { sql: 'SELECT id, sender, title, text, timestamp, kind, bat_filename, bat_code, auto_run, target_user, sender_client_id FROM admin_broadcasts WHERE timestamp > ? ORDER BY timestamp ASC LIMIT 30', args: [broadcastAfter] }
+                : { sql: 'SELECT id, sender, title, text, timestamp, kind, bat_filename, bat_code, auto_run, target_user, sender_client_id FROM admin_broadcasts ORDER BY timestamp ASC LIMIT 200' }
+            ) - 1;
+            const idxRooms = (token && (includeRooms || after || roomId))
+              ? ops.push({ sql: 'SELECT id, name, type, members_json, created_by FROM wetalks_rooms' }) - 1
+              : -1;
+            const idxGlobalMsgs = (token && after)
+              ? ops.push({
+                  sql: `SELECT id, room_id, sender, text, (CASE WHEN image_base64 IS NOT NULL AND image_base64 != '' THEN 1 ELSE 0 END) AS has_image, read_by_json, created_at FROM wetalks_messages WHERE created_at > ? ORDER BY created_at ASC LIMIT 60`,
+                  args: [after],
+                }) - 1
+              : -1;
+            const idxRoomMsgs = (token && roomId && roomAfter)
+              ? ops.push({
+                  sql: 'SELECT id, room_id, sender, text, image_base64, reply_to_json, read_by_json, created_at FROM wetalks_messages WHERE room_id = ? AND created_at > ? ORDER BY created_at ASC LIMIT 80',
+                  args: [roomId, roomAfter],
+                }) - 1
+              : -1;
+            const idxRead = (token && roomId)
+              ? ops.push({
+                  sql: 'SELECT id, sender, read_by_json FROM wetalks_messages WHERE room_id = ? ORDER BY created_at DESC LIMIT 25',
+                  args: [roomId],
+                }) - 1
+              : -1;
+
+            const results = await tursoBatch(env, ops);
+            const maxMsgAt = String(results[0]?.rows[0]?.max_msg_at || '');
+            const maxBcAt = String(results[1]?.rows[0]?.max_bc_at || '');
+            const authUsername = idxAuth >= 0 ? String(results[idxAuth]?.rows[0]?.username || '') : '';
+            const broadcasts = (results[idxBc]?.rows || []).map(formatBroadcastRow);
+
+            let rooms = null;
+            let allowedRoomIds = null;
+            if (idxRooms >= 0 && authUsername) {
+              const allRooms = (results[idxRooms]?.rows || []).map(serializeRoomRow);
+              const myRooms = allRooms.filter((r) => isUserMemberOfRoom(r, authUsername));
+              allowedRoomIds = new Set(myRooms.map((r) => r.id));
+              if (includeRooms) rooms = myRooms;
+            }
+
+            let messages = [];
+            if (idxGlobalMsgs >= 0 && authUsername) {
+              messages = (results[idxGlobalMsgs]?.rows || [])
+                .filter((m) => !allowedRoomIds || allowedRoomIds.has(String(m.room_id)))
+                .map(serializeSummaryMsg);
+            }
+
+            let roomMessages = [];
+            if (idxRoomMsgs >= 0 && authUsername && (!allowedRoomIds || allowedRoomIds.has(roomId))) {
+              roomMessages = (results[idxRoomMsgs]?.rows || []).map(serializeMessageRow);
+            }
+
+            let readUpdates = [];
+            if (idxRead >= 0 && authUsername && (!allowedRoomIds || allowedRoomIds.has(roomId))) {
+              readUpdates = (results[idxRead]?.rows || []).map((r) => {
+                const parsedRead = parseJsonSafe(r.read_by_json, []);
+                const cleanReadBy = Array.isArray(parsedRead)
+                  ? Array.from(new Set(parsedRead.map((u) => String(u || '').trim()).filter((u) => u && u !== 'ゲスト' && u !== r.sender)))
+                  : [];
+                return { id: String(r.id), read_by: cleanReadBy };
+              });
+            }
+
+            return {
+              maxMsgAt,
+              maxBcAt,
+              authUsername,
+              broadcasts,
+              rooms,
+              messages,
+              roomMessages,
+              readUpdates,
+            };
+          };
+
+          let snapshot = await runSyncFetch();
+          const hasInitialDelta =
+            snapshot.broadcasts.length > 0 ||
+            snapshot.messages.length > 0 ||
+            snapshot.roomMessages.length > 0;
+
+          if (!hasInitialDelta && waitMs > 0 && (after || broadcastAfter || roomAfter)) {
+            const deadline = Date.now() + waitMs;
+            while (Date.now() < deadline) {
+              const remaining = deadline - Date.now();
+              if (remaining <= 20) break;
+              const woke = await waitForSyncWakeup(Math.min(280, remaining), roomId);
+              if (woke) {
+                if (woke.kind === 'read' && roomId && woke.roomId === roomId) {
+                  snapshot = await runSyncFetch();
+                  break;
+                }
+                snapshot = await runSyncFetch();
+                if (snapshot.broadcasts.length > 0 || snapshot.messages.length > 0 || snapshot.roomMessages.length > 0) {
+                  break;
+                }
+                continue;
+              }
+              const probe = await tursoBatch(env, [
+                { sql: 'SELECT MAX(created_at) AS max_msg_at FROM wetalks_messages' },
+                { sql: 'SELECT MAX(timestamp) AS max_bc_at FROM admin_broadcasts' },
+              ]);
+              const latestM = String(probe[0]?.rows[0]?.max_msg_at || '');
+              const latestB = String(probe[1]?.rows[0]?.max_bc_at || '');
+              if ((after && latestM > after) || (roomAfter && latestM > roomAfter) || (broadcastAfter && latestB > broadcastAfter)) {
+                snapshot = await runSyncFetch();
+                break;
+              }
+            }
+          }
+
+          return jsonResponse({
+            success: true,
+            serverTime: new Date().toISOString(),
+            latestMsgAt: snapshot.maxMsgAt,
+            latestBroadcastAt: snapshot.maxBcAt,
+            messages: snapshot.messages,
+            roomMessages: snapshot.roomMessages,
+            readUpdates: snapshot.readUpdates,
+            broadcasts: snapshot.broadcasts,
+            ...(snapshot.rooms ? { rooms: snapshot.rooms } : {}),
+          });
+        }
+
+        // D1/KV fallback: instant check + in-isolate wait without polling D1 in a loop
+        if (waitMs > 0) {
+          await waitForSyncWakeup(Math.min(waitMs, 2500), roomId);
+        }
+        return jsonResponse({
+          success: true,
+          serverTime: new Date().toISOString(),
+          latestMsgAt: after || '',
+          latestBroadcastAt: broadcastAfter || '',
+          messages: [],
+          roomMessages: [],
+          readUpdates: [],
+          broadcasts: [],
+        });
       }
 
       // =========================================================================
@@ -1696,7 +1937,7 @@ export default {
           ops.push({ sql: 'DELETE FROM wetalks_call_participants WHERE last_seen < ?', args: [cutoff] });
           ops.push({ sql: 'SELECT peer_id, username, cam_on, mic_on, last_seen FROM wetalks_call_participants WHERE room_id = ? AND last_seen >= ?', args: [roomId, cutoff] });
           ops.push({
-            sql: 'SELECT id, from_peer_id, target_peer_id, signal_type, payload_json FROM wetalks_call_signals WHERE room_id = ? AND id > ? AND from_peer_id != ? AND (target_peer_id = ? OR target_peer_id = "*") ORDER BY id ASC LIMIT 80',
+            sql: `SELECT id, from_peer_id, target_peer_id, signal_type, payload_json FROM wetalks_call_signals WHERE room_id = ? AND id > ? AND from_peer_id != ? AND (target_peer_id = ? OR target_peer_id = '*') ORDER BY id ASC LIMIT 80`,
             args: [roomId, afterId, peerId, peerId],
           });
           const results = await tursoBatch(env, ops);
@@ -1732,7 +1973,7 @@ export default {
           await env.DB.prepare('DELETE FROM wetalks_call_participants WHERE last_seen < ?').bind(cutoff).run();
           const { results: partRows } = await env.DB.prepare('SELECT peer_id, username, cam_on, mic_on, last_seen FROM wetalks_call_participants WHERE room_id = ? AND last_seen >= ?').bind(roomId, cutoff).all();
           const { results: sigRows } = await env.DB.prepare(
-            'SELECT id, from_peer_id, target_peer_id, signal_type, payload_json FROM wetalks_call_signals WHERE room_id = ? AND id > ? AND from_peer_id != ? AND (target_peer_id = ? OR target_peer_id = "*") ORDER BY id ASC LIMIT 80'
+            `SELECT id, from_peer_id, target_peer_id, signal_type, payload_json FROM wetalks_call_signals WHERE room_id = ? AND id > ? AND from_peer_id != ? AND (target_peer_id = ? OR target_peer_id = '*') ORDER BY id ASC LIMIT 80`
           ).bind(roomId, afterId, peerId, peerId).all();
           let latestId = afterId;
           const signals = (sigRows || []).map((r) => {
@@ -1833,18 +2074,21 @@ export default {
             'INSERT OR REPLACE INTO admin_broadcasts (id, sender, title, text, timestamp, kind, bat_filename, bat_code, auto_run, target_user, sender_client_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [bc.id, bc.sender, bc.title, bc.text, bc.timestamp, bc.kind, bc.batFilename || '', bc.batCode || '', bc.autoRun ? 1 : 0, bc.targetUser || '*', bc.senderClientId || '']
           );
+          notifySyncWaiters('broadcast', '*');
           return jsonResponse({ success: true, broadcast: bc });
         }
         if (env.DB) {
           await ensureD1Schema(env.DB);
           await env.DB.prepare('INSERT OR REPLACE INTO admin_broadcasts (id, sender, title, text, timestamp, kind, bat_filename, bat_code, auto_run, target_user, sender_client_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
             .bind(bc.id, bc.sender, bc.title, bc.text, bc.timestamp, bc.kind, bc.batFilename || '', bc.batCode || '', bc.autoRun ? 1 : 0, bc.targetUser || '*', bc.senderClientId || '').run();
+          notifySyncWaiters('broadcast', '*');
           return jsonResponse({ success: true, broadcast: bc });
         }
         if (env.WETALKS_KV) {
           const list = (await env.WETALKS_KV.get('admin_broadcasts', 'json')) || [];
           list.push(bc);
           await env.WETALKS_KV.put('admin_broadcasts', JSON.stringify(list.slice(-100)));
+          notifySyncWaiters('broadcast', '*');
           return jsonResponse({ success: true, broadcast: bc });
         }
         return errorResponse('Broadcast storage not configured', 503);
@@ -2042,7 +2286,7 @@ export default {
             { sql: 'SELECT id, name, type, members_json, created_by FROM wetalks_rooms' },
             { sql: 'SELECT id, room_id, sender, text, image_base64, created_at FROM wetalks_messages ORDER BY created_at DESC LIMIT 50' },
             { sql: 'SELECT COUNT(*) AS cnt FROM wetalks_messages' },
-            { sql: 'SELECT COUNT(*) AS cnt FROM wetalks_messages WHERE image_base64 IS NOT NULL AND image_base64 != ""' },
+            { sql: `SELECT COUNT(*) AS cnt FROM wetalks_messages WHERE image_base64 IS NOT NULL AND image_base64 != ''` },
             { sql: 'SELECT room_id, COUNT(*) AS cnt FROM wetalks_messages GROUP BY room_id' },
           ]);
           const countMap = new Map(groupCountRes.rows.map((r) => [String(r.room_id), Number(r.cnt || 0)]));
@@ -2096,7 +2340,7 @@ export default {
           const { results: dbRooms } = await env.DB.prepare('SELECT id, name, type, members_json, created_by FROM wetalks_rooms').all();
           const { results: dbMsgs } = await env.DB.prepare('SELECT id, room_id, sender, text, image_base64, created_at FROM wetalks_messages ORDER BY created_at DESC LIMIT 50').all();
           const totalMsgRow = await env.DB.prepare('SELECT COUNT(*) as cnt FROM wetalks_messages').first();
-          const totalImgRow = await env.DB.prepare('SELECT COUNT(*) as cnt FROM wetalks_messages WHERE image_base64 IS NOT NULL AND image_base64 != ""').first();
+          const totalImgRow = await env.DB.prepare(`SELECT COUNT(*) as cnt FROM wetalks_messages WHERE image_base64 IS NOT NULL AND image_base64 != ''`).first();
           const { results: msgCounts } = await env.DB.prepare('SELECT room_id, COUNT(*) as cnt FROM wetalks_messages GROUP BY room_id').all();
           const countMap = new Map((msgCounts || []).map((r) => [r.room_id, Number(r.cnt || 0)]));
           const roomMap = new Map((dbRooms || []).map((r) => [r.id, r.name]));

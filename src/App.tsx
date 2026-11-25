@@ -1439,7 +1439,9 @@ export default function App() {
     } catch {}
   }, [openWindows, activeWindowId]);
 
-  // Background WeTalks desktop notification service: instant WS push + fast parallel summary polling
+  const syncEndpointWorkingRef = useRef<boolean | null>(null);
+
+  // Background WeTalks desktop notification service: instant WS push + unified long-poll (/api/wetalks/sync) + fallback polling
   useEffect(() => {
     const NOTIFIED_IDS_KEY = 'wetalks_notified_msg_ids_v1';
     const seededRooms = new Set<string>();
@@ -1449,6 +1451,20 @@ export default function App() {
     let ws: WebSocket | null = null;
     let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let subscribedUser = '';
+    let syncTimer: ReturnType<typeof setTimeout> | null = null;
+    let syncAbortController: AbortController | null = null;
+    let syncAfter = '';
+    let broadcastAfter = '';
+    let isFirstBroadcastSync = true;
+    let syncLoggedUser = '';
+    let syncBaseUrl = '';
+    const cachedRoomsMap = new Map<string, { id: string; name: string; type?: string; members?: string[] }>();
+    let syncBc: BroadcastChannel | null = null;
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        syncBc = new BroadcastChannel('wetalks_sync_channel');
+      }
+    } catch {}
 
     const getNotifiedSet = (): Set<string> => {
       try {
@@ -1727,19 +1743,191 @@ export default function App() {
       } catch {}
     };
 
+    const applySyncedRooms = (roomsList: any[]) => {
+      if (!Array.isArray(roomsList)) return;
+      for (const r of roomsList) {
+        if (r && r.id) {
+          cachedRoomsMap.set(String(r.id), {
+            id: String(r.id),
+            name: String(r.name || ''),
+            type: r.type ? String(r.type) : undefined,
+            members: Array.isArray(r.members) ? r.members.map(String) : undefined,
+          });
+        }
+      }
+    };
+
+    const scheduleSyncNext = (delayMs: number) => {
+      if (disposed) return;
+      if (syncTimer) clearTimeout(syncTimer);
+      syncTimer = setTimeout(() => {
+        runUnifiedSyncLoop();
+      }, delayMs);
+    };
+
+    const runUnifiedSyncLoop = async () => {
+      if (disposed) return;
+      const base = resolveApiBase();
+      if (!base) {
+        scheduleSyncNext(1500);
+        return;
+      }
+      const loggedUser = localStorage.getItem('wetalks_logged_in_user') || '';
+      const validUser = loggedUser && loggedUser !== 'ゲスト' ? loggedUser : '';
+      const token = validUser ? (localStorage.getItem('wetalks_auth_token') || '') : '';
+
+      if (validUser !== syncLoggedUser || base !== syncBaseUrl) {
+        syncLoggedUser = validUser;
+        syncBaseUrl = base;
+        syncAfter = '';
+        cachedRoomsMap.clear();
+      }
+      syncWsSubscription();
+
+      const isInit = (!syncAfter && Boolean(validUser)) || isFirstBroadcastSync;
+      const params = new URLSearchParams();
+      params.set('waitMs', isInit ? '0' : '3200');
+      if (syncAfter && validUser) params.set('after', syncAfter);
+      if (broadcastAfter) params.set('broadcastAfter', broadcastAfter);
+      if (isInit && validUser) params.set('includeRooms', '1');
+
+      if (syncAbortController) {
+        try { syncAbortController.abort(); } catch {}
+      }
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      syncAbortController = controller;
+      const reqTimeout = controller ? setTimeout(() => controller.abort(), isInit ? 4000 : 6500) : null;
+
+      try {
+        const headers: Record<string, string> = {};
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+        const res = await fetch(`${base}/api/wetalks/sync?${params.toString()}`, {
+          method: 'GET',
+          headers,
+          signal: controller?.signal,
+        });
+        if (res.status === 404) {
+          syncEndpointWorkingRef.current = false;
+          return;
+        }
+        if (!res.ok) {
+          scheduleSyncNext(1200);
+          return;
+        }
+        const data = await res.json();
+        syncEndpointWorkingRef.current = true;
+
+        if (Array.isArray(data.rooms)) {
+          applySyncedRooms(data.rooms);
+        }
+
+        if (Array.isArray(data.broadcasts)) {
+          for (const bc of data.broadcasts) {
+            if (bc && bc.timestamp && String(bc.timestamp) > broadcastAfter) {
+              broadcastAfter = String(bc.timestamp);
+            }
+            processIncomingBroadcastRef.current(bc, isFirstBroadcastSync);
+          }
+        }
+        isFirstBroadcastSync = false;
+        if (data.latestBroadcastAt && String(data.latestBroadcastAt) > broadcastAfter) {
+          broadcastAfter = String(data.latestBroadcastAt);
+        }
+
+        if (validUser) {
+          if (!syncAfter) {
+            syncAfter = String(data.latestMsgAt || data.serverTime || new Date().toISOString());
+          } else if (data.latestMsgAt && String(data.latestMsgAt) > syncAfter) {
+            syncAfter = String(data.latestMsgAt);
+          }
+
+          const incomingMsgs = Array.isArray(data.messages) ? data.messages : [];
+          if (incomingMsgs.length > 0) {
+            try {
+              syncBc?.postMessage({ type: 'wetalks_sync_messages', messages: incomingMsgs });
+            } catch {}
+
+            const wetalksWin = openWindowsRef.current.find((w) => w.id === 'wetalks');
+            const activeViewingRoom = localStorage.getItem('wetalks_active_viewing_room') || '';
+            const isWeTalksFocused =
+              Boolean(wetalksWin && wetalksWin.isOpen && !wetalksWin.isMinimized) &&
+              activeWindowIdRef.current === 'wetalks';
+            const notifiedSet = getNotifiedSet();
+            const newIds: string[] = [];
+
+            for (const msg of incomingMsgs) {
+              if (!msg || !msg.id) continue;
+              if (msg.created_at && String(msg.created_at) > syncAfter) {
+                syncAfter = String(msg.created_at);
+              }
+              const msgId = String(msg.id);
+              if (notifiedSet.has(msgId)) continue;
+              newIds.push(msgId);
+              if (msg.sender && msg.sender !== validUser) {
+                const roomId = String(msg.room_id || '');
+                if (isWeTalksFocused && activeViewingRoom === roomId) {
+                  continue;
+                }
+                const cachedRoom = cachedRoomsMap.get(roomId);
+                const roomDisplayName = formatRoomDisplayName(
+                  cachedRoom?.name || '',
+                  cachedRoom?.type,
+                  validUser,
+                  roomId
+                );
+                triggerWebOSNotification(
+                  String(msg.sender),
+                  String(msg.text || '') || (msg.has_image ? '📷 画像を送信しました' : ''),
+                  { id: msgId, roomId, roomName: roomDisplayName }
+                );
+              }
+            }
+            addNotifiedIds(newIds);
+          }
+        }
+
+        scheduleSyncNext(35);
+      } catch {
+        if (!disposed) {
+          scheduleSyncNext(1000);
+        }
+      } finally {
+        if (reqTimeout) clearTimeout(reqTimeout);
+        if (syncAbortController === controller) {
+          syncAbortController = null;
+        }
+      }
+    };
+
     const handleStorageOrFocus = () => {
       syncWsSubscription();
-      pollWeTalksBackground();
+      if (syncEndpointWorkingRef.current === false) {
+        pollWeTalksBackground();
+      } else {
+        if (syncAbortController) {
+          try { syncAbortController.abort(); } catch {}
+        }
+        scheduleSyncNext(20);
+      }
     };
 
     const handleStorage = (e: StorageEvent) => {
-      if (!e.key || e.key === 'wetalks_logged_in_user' || e.key === 'wetalks_backend_type_v2') {
+      if (!e.key || e.key === 'wetalks_logged_in_user' || e.key === 'wetalks_backend_type_v2' || e.key === 'wetalks_auth_token') {
         handleStorageOrFocus();
       }
     };
 
-    const initialTimer = setTimeout(pollWeTalksBackground, 200);
-    const pollInterval = setInterval(pollWeTalksBackground, 1500);
+    runUnifiedSyncLoop();
+    const initialTimer = setTimeout(() => {
+      if (syncEndpointWorkingRef.current === false) {
+        pollWeTalksBackground();
+      }
+    }, 300);
+    const pollInterval = setInterval(() => {
+      if (syncEndpointWorkingRef.current === false) {
+        pollWeTalksBackground();
+      }
+    }, 1500);
     connectOsWetalksWs();
     window.addEventListener('storage', handleStorage);
     window.addEventListener('focus', handleStorageOrFocus);
@@ -1750,7 +1938,10 @@ export default function App() {
       disposed = true;
       clearTimeout(initialTimer);
       clearInterval(pollInterval);
+      if (syncTimer) clearTimeout(syncTimer);
       if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+      try { syncAbortController?.abort(); } catch {}
+      try { syncBc?.close(); } catch {}
       window.removeEventListener('storage', handleStorage);
       window.removeEventListener('focus', handleStorageOrFocus);
       window.removeEventListener('online', handleStorageOrFocus);
@@ -1968,6 +2159,7 @@ export default function App() {
     let isFirstRun = true;
 
     const pollBroadcasts = async () => {
+      if (syncEndpointWorkingRef.current === true) return;
       try {
         const url = buildApiUrl('/api/admin/broadcasts') || getSafeAbsoluteUrl('/api/admin/broadcasts');
         const res = await fetch(url);
@@ -1984,9 +2176,16 @@ export default function App() {
       }
     };
 
-    pollBroadcasts();
-    const interval = setInterval(pollBroadcasts, 3000);
-    return () => clearInterval(interval);
+    const fallbackBootTimer = setTimeout(() => {
+      if (syncEndpointWorkingRef.current !== true) pollBroadcasts();
+    }, 600);
+    const interval = setInterval(() => {
+      if (syncEndpointWorkingRef.current !== true) pollBroadcasts();
+    }, 1500);
+    return () => {
+      clearTimeout(fallbackBootTimer);
+      clearInterval(interval);
+    };
   }, []);
 
   // Synchronize wallpaper changes on custom event updates

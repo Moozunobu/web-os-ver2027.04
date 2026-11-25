@@ -1961,15 +1961,95 @@ CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCR
       }
 
       let isPollingActiveRoom = false;
+      const lastSyncedRoomMsgAt = new Map();
+      let wetalksSyncSupported = null;
+      let wetalksSyncAbort = null;
+      let wetalksSyncTimer = null;
+      let wetalksGlobalSyncAfter = '';
 
-      async function pollActiveRoomMessages() {
+      function applyIncomingRoomMessages(targetRoomId, rawMsgs, readUpdates = null) {
+        if (!targetRoomId) return;
+        const myName = getSessionUser();
+        const normalizedApi = Array.isArray(rawMsgs) ? rawMsgs.map(normalizeMessageRecord).filter(m => m && m.id) : [];
+        const db = getLocalDB();
+        if (!db.messages) db.messages = {};
+        const currentList = Array.isArray(db.messages[targetRoomId]) ? db.messages[targetRoomId] : [];
+        const existingMap = new Map();
+        currentList.forEach(m => { if (m && m.id) existingMap.set(String(m.id), m); });
+
+        let hasUnreadFromOthers = false;
+        let maxCreatedAt = lastSyncedRoomMsgAt.get(targetRoomId) || '';
+
+        normalizedApi.forEach(m => {
+          const prev = existingMap.get(String(m.id));
+          if (prev && prev.image_base64 && !m.image_base64) {
+            m.image_base64 = prev.image_base64;
+          }
+          existingMap.set(String(m.id), m);
+          if (m.created_at && String(m.created_at) > maxCreatedAt) {
+            maxCreatedAt = String(m.created_at);
+          }
+          if (myName && myName !== 'ゲスト' && m.sender && m.sender !== myName && !parseReadBy(m).includes(myName)) {
+            hasUnreadFromOthers = true;
+          }
+        });
+
+        if (Array.isArray(readUpdates) && readUpdates.length > 0) {
+          readUpdates.forEach(ru => {
+            if (!ru || !ru.id) return;
+            const existing = existingMap.get(String(ru.id));
+            if (existing && Array.isArray(ru.read_by)) {
+              existing.read_by = ru.read_by;
+            }
+          });
+        }
+
+        if (maxCreatedAt) {
+          lastSyncedRoomMsgAt.set(targetRoomId, maxCreatedAt);
+        }
+
+        const merged = Array.from(existingMap.values()).sort((a, b) =>
+          String(a.created_at || '').localeCompare(String(b.created_at || ''))
+        );
+        db.messages[targetRoomId] = merged;
+        saveLocalDB(db);
+
+        if (targetRoomId === activeRoomId && currentView === 'chat') {
+          if (hasUnreadFromOthers && isViewActiveForRead()) {
+            markActiveRoomAsRead(targetRoomId, true);
+          }
+          let hasNew = false;
+          const currentRoomTitle = (DOM.titleText && DOM.titleText.textContent) || '';
+          normalizedApi.forEach(msg => {
+            checkAndNotifyNewMessage(msg, currentRoomTitle);
+            const existingEl = DOM.messageContainer && Array.from(DOM.messageContainer.children).find(el => el.getAttribute('data-msgid') === String(msg.id));
+            if (!existingEl) {
+              appendMessageBubble(msg);
+              hasNew = true;
+            } else {
+              const staleErr = existingEl.querySelector('.msg-sync-error');
+              if (staleErr) staleErr.remove();
+            }
+          });
+          updateReadReceipts();
+          if (hasNew && DOM.messageContainer) {
+            DOM.messageContainer.scrollTop = DOM.messageContainer.scrollHeight;
+          }
+        }
+      }
+
+      async function pollActiveRoomMessages(forceFull = false) {
         const targetRoomId = activeRoomId;
         if (!targetRoomId || currentView !== 'chat' || isPollingActiveRoom) return;
         isPollingActiveRoom = true;
         try {
           syncServerPresence();
           const shouldMarkRead = isViewActiveForRead();
-          const querySuffix = shouldMarkRead ? '?markRead=1' : '';
+          const knownAfter = !forceFull ? (lastSyncedRoomMsgAt.get(targetRoomId) || '') : '';
+          const qs = [];
+          if (shouldMarkRead) qs.push('markRead=1');
+          if (knownAfter) qs.push('after=' + encodeURIComponent(knownAfter));
+          const querySuffix = qs.length > 0 ? ('?' + qs.join('&')) : '';
           const msgRes = await callServerAPIWithStatus('/api/wetalks/messages/' + encodeURIComponent(targetRoomId) + querySuffix);
           if (targetRoomId !== activeRoomId || currentView !== 'chat') return;
           if (msgRes.status === 403) {
@@ -1984,49 +2064,61 @@ CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCR
             ? rawApiMsgs
             : (rawApiMsgs && Array.isArray(rawApiMsgs.messages) ? rawApiMsgs.messages : null);
           if (apiMsgs) {
-            const myName = getSessionUser();
-            const normalizedApi = apiMsgs.map(normalizeMessageRecord);
-            const hasUnreadFromOthers = shouldMarkRead && myName && myName !== 'ゲスト' && normalizedApi.some(
-              m => m && m.sender && m.sender !== myName && !parseReadBy(m).includes(myName)
-            );
-            if (hasUnreadFromOthers) {
-              markActiveRoomAsRead(targetRoomId, true);
-            }
-
-            const db = getLocalDB();
-            if (!db.messages) db.messages = {};
-            const serverIds = new Set(normalizedApi.filter(m => m && m.id).map(m => String(m.id)));
-            const existingMap = new Map();
-            (db.messages[targetRoomId] || []).forEach(m => {
-              if (m && m.id && m._pendingSync && !serverIds.has(String(m.id))) {
-                existingMap.set(String(m.id), m);
+            if (knownAfter) {
+              applyIncomingRoomMessages(targetRoomId, apiMsgs, null);
+            } else {
+              const myName = getSessionUser();
+              const normalizedApi = apiMsgs.map(normalizeMessageRecord);
+              const hasUnreadFromOthers = shouldMarkRead && myName && myName !== 'ゲスト' && normalizedApi.some(
+                m => m && m.sender && m.sender !== myName && !parseReadBy(m).includes(myName)
+              );
+              if (hasUnreadFromOthers) {
+                markActiveRoomAsRead(targetRoomId, true);
               }
-            });
-            normalizedApi.forEach(m => { if (m && m.id) existingMap.set(String(m.id), m); });
-            const merged = Array.from(existingMap.values()).sort((a, b) =>
-              String(a.created_at || '').localeCompare(String(b.created_at || ''))
-            );
-            db.messages[targetRoomId] = merged;
-            saveLocalDB(db);
 
-            let hasNew = false;
-            const currentRoomTitle = (DOM.titleText && DOM.titleText.textContent) || '';
-            normalizedApi.forEach(msg => {
-              if (msg && msg.id) {
-                checkAndNotifyNewMessage(msg, currentRoomTitle);
-                const existingEl = DOM.messageContainer && Array.from(DOM.messageContainer.children).find(el => el.getAttribute('data-msgid') === String(msg.id));
-                if (!existingEl) {
-                  appendMessageBubble(msg);
-                  hasNew = true;
-                } else {
-                  const staleErr = existingEl.querySelector('.msg-sync-error');
-                  if (staleErr) staleErr.remove();
+              const db = getLocalDB();
+              if (!db.messages) db.messages = {};
+              const serverIds = new Set(normalizedApi.filter(m => m && m.id).map(m => String(m.id)));
+              const existingMap = new Map();
+              (db.messages[targetRoomId] || []).forEach(m => {
+                if (m && m.id && m._pendingSync && !serverIds.has(String(m.id))) {
+                  existingMap.set(String(m.id), m);
                 }
+              });
+              let maxAt = '';
+              normalizedApi.forEach(m => {
+                if (m && m.id) {
+                  existingMap.set(String(m.id), m);
+                  if (m.created_at && String(m.created_at) > maxAt) maxAt = String(m.created_at);
+                }
+              });
+              if (maxAt) lastSyncedRoomMsgAt.set(targetRoomId, maxAt);
+
+              const merged = Array.from(existingMap.values()).sort((a, b) =>
+                String(a.created_at || '').localeCompare(String(b.created_at || ''))
+              );
+              db.messages[targetRoomId] = merged;
+              saveLocalDB(db);
+
+              let hasNew = false;
+              const currentRoomTitle = (DOM.titleText && DOM.titleText.textContent) || '';
+              normalizedApi.forEach(msg => {
+                if (msg && msg.id) {
+                  checkAndNotifyNewMessage(msg, currentRoomTitle);
+                  const existingEl = DOM.messageContainer && Array.from(DOM.messageContainer.children).find(el => el.getAttribute('data-msgid') === String(msg.id));
+                  if (!existingEl) {
+                    appendMessageBubble(msg);
+                    hasNew = true;
+                  } else {
+                    const staleErr = existingEl.querySelector('.msg-sync-error');
+                    if (staleErr) staleErr.remove();
+                  }
+                }
+              });
+              updateReadReceipts();
+              if (hasNew && DOM.messageContainer) {
+                DOM.messageContainer.scrollTop = DOM.messageContainer.scrollHeight;
               }
-            });
-            updateReadReceipts();
-            if (hasNew && DOM.messageContainer) {
-              DOM.messageContainer.scrollTop = DOM.messageContainer.scrollHeight;
             }
           }
           retryPendingMessagesForRoom(targetRoomId);
@@ -2594,6 +2686,7 @@ CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCR
           DOM.titleText.textContent = 'We talks';
           renderLobby();
           syncServerPresence();
+          if (typeof restartWetalksSyncLoop === 'function') restartWetalksSyncLoop();
         } else if (view === 'chat') {
           if (renderedChatRoomId !== activeRoomId) {
             if (typeof callState !== 'undefined' && callState.active && callState.roomId !== activeRoomId) {
@@ -2619,6 +2712,7 @@ CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCR
               probeRoomCallStatus(activeRoomId);
             }
             if (typeof updateRoomCallBanner === 'function') updateRoomCallBanner();
+            if (typeof restartWetalksSyncLoop === 'function') restartWetalksSyncLoop();
           }
         } else if (view === 'settings') {
           stopLocalPresence();
@@ -3601,6 +3695,11 @@ CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCR
               : (rawApiMsgs && Array.isArray(rawApiMsgs.messages) ? rawApiMsgs.messages : null);
             if (apiMsgs) {
               const normalizedApi = apiMsgs.map(normalizeMessageRecord);
+              let maxAt = '';
+              normalizedApi.forEach(m => {
+                if (m && m.created_at && String(m.created_at) > maxAt) maxAt = String(m.created_at);
+              });
+              if (maxAt) lastSyncedRoomMsgAt.set(targetRoomId, maxAt);
               const serverIds = new Set(normalizedApi.filter(m => m && m.id).map(m => String(m.id)));
               const pendingLocal = localMsgs.filter(m => m && m.id && m._pendingSync && !serverIds.has(String(m.id)));
               msgs = [...normalizedApi, ...pendingLocal].sort((a, b) =>
@@ -3610,6 +3709,7 @@ CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCR
               if (!db.messages) db.messages = {};
               db.messages[targetRoomId] = msgs;
               saveLocalDB(db);
+              if (typeof restartWetalksSyncLoop === 'function') restartWetalksSyncLoop();
             } else {
               msgs = localMsgs.map(normalizeMessageRecord);
             }
@@ -5223,8 +5323,11 @@ CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCR
               return;
             }
             const d = res.data;
+            const uCount = d.usersImported ?? d.users ?? 0;
+            const rCount = d.roomsImported ?? d.rooms ?? 0;
+            const mCount = d.messagesImported ?? d.messages ?? 0;
             setMigrateStatus(
-              '✅ Turso への移行が完了しました！（ユーザー: ' + (d.users || 0) + '件, ルーム: ' + (d.rooms || 0) + '件, 履歴: ' + (d.messages || 0) + '件）',
+              '✅ Turso への移行が完了しました！（ユーザー: ' + uCount + '件, ルーム: ' + rCount + '件, 履歴: ' + mCount + '件）',
               false,
               true
             );
@@ -5308,8 +5411,11 @@ CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCR
               setMigrateStatus('❌ インポート失敗: ' + ((data && data.error) || ('HTTP ' + resp.status)), true, false);
               return;
             }
+            const uCount = data.usersImported ?? data.users ?? 0;
+            const rCount = data.roomsImported ?? data.rooms ?? 0;
+            const mCount = data.messagesImported ?? data.messages ?? 0;
             setMigrateStatus(
-              '✅ Turso インポート完了（ユーザー: ' + (data.users || 0) + '件, ルーム: ' + (data.rooms || 0) + '件, 履歴: ' + (data.messages || 0) + '件）',
+              '✅ Turso インポート完了（ユーザー: ' + uCount + '件, ルーム: ' + rCount + '件, 履歴: ' + mCount + '件）',
               false,
               true
             );
@@ -7541,7 +7647,11 @@ CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCR
               }
               if (data.type === 'wetalks_event') {
                 if (currentView === 'chat' && activeRoomId && data.roomId === activeRoomId) {
-                  pollActiveRoomMessages();
+                  if (data.event === 'message' && data.message && data.message.id && !data.message.has_image) {
+                    applyIncomingRoomMessages(activeRoomId, [data.message], null);
+                  } else {
+                    pollActiveRoomMessages(data.event === 'read');
+                  }
                 } else {
                   if (data.event === 'message' && data.message && data.message.id && data.message.sender) {
                     const me = getSessionUser();
@@ -7569,16 +7679,158 @@ CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCR
         } catch(e) {}
       }
 
-      // Fast adaptive polling: 1.5s while actively inside a chat room, 3s background/lobby sync
+      // Listen for instant sync messages relayed from parent WebOS shell
+      try {
+        if (typeof BroadcastChannel !== 'undefined') {
+          const parentSyncBc = new BroadcastChannel('wetalks_sync_channel');
+          parentSyncBc.onmessage = (ev) => {
+            const payload = ev && ev.data;
+            if (!payload || payload.type !== 'wetalks_sync_messages' || !Array.isArray(payload.messages)) return;
+            const myName = getSessionUser();
+            if (!myName || myName === 'ゲスト') return;
+            let lobbyNeedsRefresh = false;
+            payload.messages.forEach(msg => {
+              if (!msg || !msg.id) return;
+              const rId = String(msg.room_id || '');
+              if (currentView === 'chat' && activeRoomId && rId === activeRoomId) {
+                if (msg.has_image) {
+                  pollActiveRoomMessages(false);
+                } else {
+                  applyIncomingRoomMessages(activeRoomId, [msg], null);
+                }
+              } else if (rId && msg.sender && msg.sender !== myName) {
+                if (!isMessageAlreadySeen(msg.id)) {
+                  unreadCounts[rId] = (unreadCounts[rId] || 0) + 1;
+                  checkAndNotifyNewMessage(msg, resolveRoomDisplayName(rId, ''));
+                  lobbyNeedsRefresh = true;
+                }
+              }
+            });
+            if (lobbyNeedsRefresh && currentView === 'lobby') {
+              renderLobby();
+            }
+          };
+        }
+      } catch(e) {}
+
+      function restartWetalksSyncLoop() {
+        if (wetalksSyncSupported === false) return;
+        if (wetalksSyncAbort) {
+          try { wetalksSyncAbort.abort(); } catch(e) {}
+          wetalksSyncAbort = null;
+        }
+        if (wetalksSyncTimer) {
+          clearTimeout(wetalksSyncTimer);
+          wetalksSyncTimer = null;
+        }
+        wetalksSyncTimer = setTimeout(() => {
+          runWetalksSyncLoop();
+        }, 25);
+      }
+
+      async function runWetalksSyncLoop() {
+        const myName = getSessionUser();
+        const token = getAuthToken();
+        if (!myName || myName === 'ゲスト' || !token || token === 'legacy-cf') {
+          wetalksSyncTimer = setTimeout(runWetalksSyncLoop, 1200);
+          return;
+        }
+        const backend = getBackendType();
+        if (backend !== 'cloudflare' && backend !== 'internal') {
+          wetalksSyncTimer = setTimeout(runWetalksSyncLoop, 2000);
+          return;
+        }
+
+        const isInit = !wetalksGlobalSyncAfter;
+        const targetRoomId = (currentView === 'chat' && activeRoomId) ? String(activeRoomId) : '';
+        const roomAfter = targetRoomId ? (lastSyncedRoomMsgAt.get(targetRoomId) || '') : '';
+        const params = new URLSearchParams();
+        params.set('waitMs', isInit ? '0' : '3200');
+        if (wetalksGlobalSyncAfter) params.set('after', wetalksGlobalSyncAfter);
+        if (targetRoomId) params.set('roomId', targetRoomId);
+        if (targetRoomId && roomAfter) params.set('roomAfter', roomAfter);
+
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        wetalksSyncAbort = controller;
+        const timeoutTimer = controller ? setTimeout(() => controller.abort(), isInit ? 4000 : 6500) : null;
+
+        try {
+          const url = buildApiUrl('/api/wetalks/sync?' + params.toString());
+          const headers = { Authorization: 'Bearer ' + token };
+          const resp = await fetch(url, {
+            method: 'GET',
+            headers,
+            signal: controller ? controller.signal : undefined
+          });
+          if (resp.status === 404) {
+            wetalksSyncSupported = false;
+            return;
+          }
+          if (!resp.ok) {
+            wetalksSyncTimer = setTimeout(runWetalksSyncLoop, 1200);
+            return;
+          }
+          const data = await resp.json();
+          wetalksSyncSupported = true;
+
+          if (!wetalksGlobalSyncAfter) {
+            wetalksGlobalSyncAfter = String(data.latestMsgAt || data.serverTime || new Date().toISOString());
+          } else if (data.latestMsgAt && String(data.latestMsgAt) > wetalksGlobalSyncAfter) {
+            wetalksGlobalSyncAfter = String(data.latestMsgAt);
+          }
+
+          if (targetRoomId && ((Array.isArray(data.roomMessages) && data.roomMessages.length > 0) || (Array.isArray(data.readUpdates) && data.readUpdates.length > 0))) {
+            applyIncomingRoomMessages(targetRoomId, data.roomMessages || [], data.readUpdates || null);
+          }
+
+          const incomingGlobal = Array.isArray(data.messages) ? data.messages : [];
+          if (incomingGlobal.length > 0) {
+            let unreadChanged = false;
+            incomingGlobal.forEach(msg => {
+              if (!msg || !msg.id) return;
+              if (msg.created_at && String(msg.created_at) > wetalksGlobalSyncAfter) {
+                wetalksGlobalSyncAfter = String(msg.created_at);
+              }
+              const rId = String(msg.room_id || '');
+              if (rId && rId !== activeRoomId && msg.sender && msg.sender !== myName) {
+                if (!isMessageAlreadySeen(msg.id)) {
+                  unreadCounts[rId] = (unreadCounts[rId] || 0) + 1;
+                  unreadChanged = true;
+                  checkAndNotifyNewMessage(msg, resolveRoomDisplayName(rId, ''));
+                }
+              }
+            });
+            if (unreadChanged && currentView === 'lobby') {
+              renderLobby();
+            }
+          }
+
+          wetalksSyncTimer = setTimeout(runWetalksSyncLoop, 30);
+        } catch(e) {
+          wetalksSyncTimer = setTimeout(runWetalksSyncLoop, 900);
+        } finally {
+          if (timeoutTimer) clearTimeout(timeoutTimer);
+          if (wetalksSyncAbort === controller) wetalksSyncAbort = null;
+        }
+      }
+
+      // Adaptive polling: 8s safety reconciliation when real-time long-poll (/api/wetalks/sync) is active, 900ms fallback otherwise
       let pollTickCount = 0;
       setInterval(async () => {
         pollTickCount++;
         try {
+          const syncActive = wetalksSyncSupported === true;
+          if (syncActive && pollTickCount % 8 !== 0) {
+            if (currentView === 'chat' && activeRoomId && !callState.active && pollTickCount % 2 === 0) {
+              probeRoomCallStatus(activeRoomId);
+            }
+            return;
+          }
           if (currentView === 'chat' && activeRoomId) {
             if (!callState.active) {
               probeRoomCallStatus(activeRoomId);
             }
-            await pollActiveRoomMessages();
+            await pollActiveRoomMessages(false);
             if (pollTickCount % 2 === 0) {
               await pollBackgroundOtherRooms();
             }
@@ -7590,7 +7842,7 @@ CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCR
             }
           }
         } catch(e) {}
-      }, 1500);
+      }, 1000);
 
       initSupabase();
       initGlobalDeleteListener();
@@ -7599,6 +7851,7 @@ CREATE TABLE IF NOT EXISTS wetalks_call_signals (id INTEGER PRIMARY KEY AUTOINCR
           setTimeout(() => pollBackgroundOtherRooms(true), 400);
         }
         connectInternalWetalksWs();
+        runWetalksSyncLoop();
       });
     })();
   </script>

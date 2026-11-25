@@ -85,7 +85,7 @@ export const ALL_TERMINAL_COMMANDS = [
   'alias', 'unalias', 'history', 'sprout', 'bat', 'call', 'mkbat', 'sendbat', 'redirect', 'seturl', 'churl',
   'js', 'eval', 'calc', 'json', 'base64', 'hash', 'uuid', 'genpass', 'ping', 'curl', 'fetch', 'ipconfig',
   'ifconfig', 'weather', 'nmap', 'timer', 'countdown', 'roll', 'banner',
-  'matrix', 'fortune', 'ver', 'version', 'os', 'select-os', 'aboad', 'git',
+  'matrix', 'fortune', 'ver', 'version', 'winver', 'uname', 'os', 'select-os', 'aboad', 'git',
   'msg', 'net', 'broadcast', 'html', 'sudo', 'admin'
 ];
 
@@ -749,7 +749,8 @@ export function getHelpLines(topic?: string): string[] {
       '  wallpaper [list|番号|URL] - 壁紙一覧表示・壁紙変更',
       '  notify <msg>              - デスクトップ通知を送信 (タイトル | 本文 も可)',
       '  lock / reboot             - ロック画面へ移行 / OS再起動',
-      '  ver / os [version]        - OSバージョン確認・OSエディション切替',
+      '  ver / version / winver    - OSバージョン確認 (web-os-ver2027.05r)',
+      '  os [version]              - OSエディション切替',
     ];
   }
   if (t === 'net' || t === 'network') {

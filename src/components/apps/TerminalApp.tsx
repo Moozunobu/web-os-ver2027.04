@@ -51,6 +51,8 @@ export interface TerminalAppProps {
   onBatPayloadConsumed?: () => void;
 }
 
+const WEB_OS_VERSION = 'web-os-ver2027.05r';
+
 const FORTUNES = [
   '「動くコード」から「読みやすいコード」へ。リファクタリングは未来の自分へのプレゼントです。',
   'まずは小さく動かして、測定してから最適化しよう。(Premature optimization is the root of all evil.)',
@@ -97,7 +99,7 @@ export const TerminalApp: React.FC<TerminalAppProps> = ({
   onBatPayloadConsumed,
 }) => {
   const [history, setHistory] = useState<string[]>([
-    'Abord OS PowerShell / CLI [Version 2.0.0]',
+    `Abord Web OS PowerShell / CLI [Version ${WEB_OS_VERSION}]`,
     '(c) Abord Corporation. All rights reserved.',
     '',
     'Type "help" to list commands (e.g. help bat, help files, help os, help net, help dev).',
@@ -988,6 +990,7 @@ export const TerminalApp: React.FC<TerminalAppProps> = ({
             `Privilege : ${adminState === 'authorized' ? 'Administrator (Level 0)' : 'Standard User'}`,
             `Language  : ${settings?.language || 'ja'}`,
             `Timezone  : ${settings?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone}`,
+            `OS        : Abord Web OS (${WEB_OS_VERSION})`,
             `Terminal  : Abord CLI v2.0 (Theme: ${theme.id})`,
           ],
         };
@@ -1255,7 +1258,7 @@ export const TerminalApp: React.FC<TerminalAppProps> = ({
         const res = typeof window !== 'undefined' ? `${window.innerWidth}x${window.innerHeight}` : 'N/A';
         return {
           lines: [
-            '      █████╗ ██████╗  ██████╗ ██████╗ ██████╗     OS      : Abord OS 2027.2 WebOS',
+            `      █████╗ ██████╗  ██████╗ ██████╗ ██████╗     OS      : Abord Web OS (${WEB_OS_VERSION})`,
             `     ██╔══██╗██╔══██╗██╔═══██╗██╔══██╗██╔══██╗    User    : ${settings?.username || 'User'}`,
             `     ███████║██████╔╝██║   ██║██████╔╝██║  ██║    Theme   : ${settings?.isDarkTheme ? 'Dark' : 'Light'} / CLI:${theme.id}`,
             `     ██╔══██║██╔══██╗██║   ██║██╔══██╗██╔══██╗    Windows : ${openCount} open`,
@@ -1606,9 +1609,11 @@ export const TerminalApp: React.FC<TerminalAppProps> = ({
       case 'ver':
       case 'version':
       case 'winver':
+      case 'uname':
         return {
           lines: [
-            'Abord2027.2 Web OS [Version 2027.01.29]',
+            `Abord Web OS [Version ${WEB_OS_VERSION}]`,
+            `Version: ${WEB_OS_VERSION}`,
             'Copyright (C) 2027 Abord Corporation. All rights reserved.',
           ],
         };
